@@ -272,31 +272,42 @@ calc_disk_info() {
 }
 
 get_system_info() {
-    # 兼容 x86_64 与 ARM64 的 CPU 型号识别
+    # 1. 兼容 x86_64 与 ARM64 的 CPU 型号识别
     cname=""
     if command -v lscpu >/dev/null 2>&1; then
         cname=$(LC_ALL=C lscpu 2>/dev/null | awk -F: '/^Model name:/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}')
     fi
-    [[ -z "$cname" ]] && cname=$(awk -F: '/model name|Processor|cpu model/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}' /proc/cpuinfo 2>/dev/null)
+    if [[ -z "$cname" ]]; then
+        cname=$(awk -F: '/model name|Processor|cpu model/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}' /proc/cpuinfo 2>/dev/null)
+    fi
     [[ -z "$cname" ]] && cname="Unknown CPU"
 
+    # 2. CPU 核心数识别
     cores=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null)
-    [[ -z "$cores" || "$cores" -eq 0 ]] && cores=$(nproc 2>/dev/null || echo 1)
+    if [[ -z "$cores" || "$cores" -eq 0 ]]; then
+        cores=$(nproc 2>/dev/null || echo 1)
+    fi
 
-    # 兼容 ARM 与动态调频的 CPU 频率获取
+    # 3. 兼容 ARM 与动态调频的 CPU 频率获取
     freq=$(awk -F: '/cpu MHz/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); printf "%.0f", $2; exit}' /proc/cpuinfo 2>/dev/null)
     if [[ -z "$freq" && -r /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq ]]; then
         freq=$(awk '{printf "%.0f", $1 / 1000}' /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq 2>/dev/null)
     fi
-    [[ -z "$freq" && command -v lscpu >/dev/null 2>&1 ]] && freq=$(LC_ALL=C lscpu 2>/dev/null | awk -F: '/CPU max MHz|CPU MHz/ {gsub(/^[ \t]+/, "", $2); printf "%.0f", $2; exit}')
+    if [[ -z "$freq" ]] && command -v lscpu >/dev/null 2>&1; then
+        freq=$(LC_ALL=C lscpu 2>/dev/null | awk -F: '/CPU max MHz|CPU MHz/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); printf "%.0f", $2; exit}')
+    fi
     [[ -z "$freq" ]] && freq="N/A"
 
+    # 4. CPU 缓存大小识别
     corescache=$(awk -F: '/cache size/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}' /proc/cpuinfo 2>/dev/null)
-    [[ -z "$corescache" && command -v lscpu >/dev/null 2>&1 ]] && corescache=$(LC_ALL=C lscpu 2>/dev/null | awk -F: '/L3 cache|L2 cache/ {gsub(/^[ \t]+/, "", $2); print $2; exit}')
+    if [[ -z "$corescache" ]] && command -v lscpu >/dev/null 2>&1; then
+        corescache=$(LC_ALL=C lscpu 2>/dev/null | awk -F: '/L3 cache|L2 cache/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}')
+    fi
     [[ -z "$corescache" ]] && corescache="N/A"
 
-    # 直接读取 /proc/meminfo，兼容 BusyBox/Alpine 等各种版本的 free 命令差异
+    # 5. 内存与 Swap 统计（直接读取 /proc/meminfo 兼容所有发行版）
     tram=$(awk '/^MemTotal:/ {printf "%.0f", $2 / 1024}' /proc/meminfo 2>/dev/null)
+    tram=${tram:-0}
     local mavail mfree mbuff mcached
     mavail=$(awk '/^MemAvailable:/ {printf "%.0f", $2 / 1024}' /proc/meminfo 2>/dev/null)
     mfree=$(awk '/^MemFree:/ {printf "%.0f", $2 / 1024}' /proc/meminfo 2>/dev/null)
@@ -308,12 +319,16 @@ get_system_info() {
     else
         uram=$(( tram - ${mfree:-0} - bram ))
     fi
+    [[ $uram -lt 0 ]] && uram=0
 
     swap=$(awk '/^SwapTotal:/ {printf "%.0f", $2 / 1024}' /proc/meminfo 2>/dev/null)
+    swap=${swap:-0}
     local sfree
     sfree=$(awk '/^SwapFree:/ {printf "%.0f", $2 / 1024}' /proc/meminfo 2>/dev/null)
-    uswap=$(( ${swap:-0} - ${sfree:-0} ))
+    uswap=$(( swap - ${sfree:-0} ))
+    [[ $uswap -lt 0 ]] && uswap=0
 
+    # 6. 运行时间、负载与系统架构信息
     up=$(awk '{a=$1/86400; b=($1%86400)/3600; c=($1%3600)/60} {printf("%d days %d hour %d min\n",a,b,c)}' /proc/uptime 2>/dev/null)
     load=$(awk '{print $1", "$2", "$3}' /proc/loadavg 2>/dev/null)
     opsy=$(get_opsy)
@@ -321,10 +336,13 @@ get_system_info() {
     lbit=$(getconf LONG_BIT 2>/dev/null || echo "64")
     kern=$(uname -r)
 
+    # 7. 磁盘容量、TCP 拥塞控制与虚拟化检测
     calc_disk_info
 
     tcpctrl="N/A"
-    [[ -r /proc/sys/net/ipv4/tcp_congestion_control ]] && tcpctrl=$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null)
+    if [[ -r /proc/sys/net/ipv4/tcp_congestion_control ]]; then
+        tcpctrl=$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null)
+    fi
 
     virt_check
 }
