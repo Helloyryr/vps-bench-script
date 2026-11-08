@@ -536,7 +536,6 @@ speed_cloudflare_fallback() {
         fi
     fi
 }
-
 speed_test() {
     local node_id=$1
     local node_name=$2
@@ -550,11 +549,18 @@ speed_test() {
     fi
 
     if grep -q "Upload:" "$SPEED_LOG" 2>/dev/null; then
-        local dl up lat
+        local dl up lat current_url
         dl=$(awk '/Download:/ {print $2}' "$SPEED_LOG")
         up=$(awk '/Upload:/ {print $2}' "$SPEED_LOG")
         lat=$(awk '/Idle Latency:|Latency:/ {print $2; exit}' "$SPEED_LOG")
-        RESULT_SPEED=$(awk '/Result URL:/ {print $3}' "$SPEED_LOG")
+        current_url=$(awk '/Result URL:/ {print $3}' "$SPEED_LOG")
+
+        # 优先锁定默认主节点的 Speedtest 官方结果链接；若主节点未生成则用后续成功节点兜底
+        if [[ -n "$current_url" ]]; then
+            if [[ -z "$node_id" || -z "${RESULT_SPEED:-}" ]]; then
+                RESULT_SPEED="$current_url"
+            fi
+        fi
 
         if [[ -n "$dl" ]]; then
             printf "${YELLOW}%-18s${GREEN}%-18s${RED}%-20s${SKYBLUE}%-12s${PLAIN}\n" " ${node_name}" "${up} Mbit/s" "${dl} Mbit/s" "${lat:-N/A} ms" | tee -a "$LOG_FILE"
@@ -605,7 +611,6 @@ print_end_time() {
         echo -ne " Finished in  : ${time} sec\n" | tee -a "$LOG_FILE"
     fi
 
-    # 直接使用系统时区转换获取北京时间，告别失效的腾讯 CGI 接口
     bj_time=$(TZ='Asia/Shanghai' date "+%Y-%m-%d %H:%M:%S" 2>/dev/null || date -u "+%Y-%m-%d %H:%M:%S UTC")
     echo " Timestamp    : $bj_time (GMT+8)" | tee -a "$LOG_FILE"
     echo " Results Log  : $LOG_FILE"
@@ -614,22 +619,31 @@ print_end_time() {
 sharetest() {
     command -v curl >/dev/null 2>&1 || return
     local clean_log="$WORK_DIR/superbench_clean.log"
-    # 剥离 ANSI 颜色控制字符，修复原版无意义的 $() 命令替换调用
+    # 剥离 ANSI 颜色字符，保证在线预览排版整洁
     sed -r "s/\x1B\[([0-9]{1,2}(;[0-9]{1,2})?)?[m|K]//g" "$LOG_FILE" > "$clean_log" 2>/dev/null
 
     local share_link=""
     case "${1:-paste_rs}" in
         'clbin')
-            share_link=$(curl -fsSL --max-time 10 -F 'clbin=<-' https://clbin.com < "$clean_log" 2>/dev/null)
+            share_link=$(curl -fsSL --max-time 10 -F 'clbin=<-' https://clbin.com < "$clean_log" 2>/dev/null | tr -d '\r\n ')
             ;;
         *)
-            share_link=$(curl -fsSL --max-time 10 --data-binary @"$clean_log" https://paste.rs 2>/dev/null)
+            share_link=$(curl -fsSL --max-time 10 --data-binary @"$clean_log" https://paste.rs 2>/dev/null | tr -d '\r\n ')
+            # 若 paste.rs 网络超时，自动切换 clbin.com 兜底
+            if [[ -z "$share_link" ]]; then
+                share_link=$(curl -fsSL --max-time 10 -F 'clbin=<-' https://clbin.com < "$clean_log" 2>/dev/null | tr -d '\r\n ')
+            fi
             ;;
     esac
 
     echo " Share result:" | tee -a "$LOG_FILE"
-    [[ -n "${RESULT_SPEED:-}" ]] && echo " · Speedtest : $RESULT_SPEED" | tee -a "$LOG_FILE"
-    [[ -n "$share_link" ]] && echo " · Log Paste : $share_link" | tee -a "$LOG_FILE"
+    if [[ -n "${RESULT_SPEED:-}" ]]; then
+        echo " · Speedtest : $RESULT_SPEED" | tee -a "$LOG_FILE"
+        echo " · SpeedPic  : ${RESULT_SPEED}.png" | tee -a "$LOG_FILE"
+    fi
+    if [[ -n "$share_link" ]]; then
+        echo " · Log Paste : $share_link" | tee -a "$LOG_FILE"
+    fi
     next
 }
 
@@ -652,6 +666,7 @@ bench_all() {
     next
     print_end_time
     next
+    sharetest "${1:-paste_rs}"
 }
 
 fast_bench() {
@@ -671,6 +686,7 @@ fast_bench() {
     next
     print_end_time
     next
+    sharetest "${1:-paste_rs}"
 }
 
 # ======================== CLI 参数路由 ========================
@@ -684,19 +700,13 @@ case "$ACTION" in
     'io'|'-io'|'--io')
         benchinit; next; print_io; next ;;
     'speed'|'-speed'|'--speed')
-        benchinit; next; print_speedtest; next ;;
+        benchinit; next; print_speedtest; next; sharetest ;;
     'ip'|'-ip'|'--ip')
         benchinit; next; ip_info; next ;;
     'fast'|'-f'|'--fast')
-        fast_bench ;;
+        fast_bench "${2:-paste_rs}" ;;
     'share'|'-s'|'--share')
-        bench_all
-        sharetest "${2:-paste_rs}"
-        ;;
+        bench_all "${2:-paste_rs}" ;;
     'bench'|'-a'|'--all'|*)
-        bench_all
-        if [[ "${2:-}" =~ ^(-s|--share|share)$ ]]; then
-            sharetest "${3:-paste_rs}"
-        fi
-        ;;
+        bench_all "${2:-paste_rs}" ;;
 esac
