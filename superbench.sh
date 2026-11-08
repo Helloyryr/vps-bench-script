@@ -3,7 +3,7 @@
 # Description : Modernized Cross-Platform System Info, I/O & Network Benchmark Script
 # Based on    : Superbench.sh by Oldking & Bench.sh by Teddysun
 # License     : MIT License
-# Version     : v2.1.0
+# Version     : v2.2.0
 #
 
 # 开启管道错误传递，未定义变量在关键处手动校验以保证兼容性
@@ -16,11 +16,11 @@ YELLOW='\033[0;33m'
 SKYBLUE='\033[0;36m'
 PLAIN='\033[0m'
 
-VERSION="2.1.0"
+VERSION="2.2.0"
 SPEEDTEST_VER="1.2.0"
 START_TIME=$(date +%s)
 
-# 全局目录与文件变量（由 init_environment 动态安全分配）
+# 全局目录与文件变量（由 benchinit 动态安全分配）
 WORK_DIR=""
 IO_DIR=""
 LOG_FILE=""
@@ -30,7 +30,6 @@ HAS_ROOT=0
 
 # ======================== 权限与目录安全初始化 ========================
 
-# 检查 Root 或免密 sudo 权限
 check_privilege() {
     if [[ $EUID -eq 0 ]]; then
         HAS_ROOT=1
@@ -54,13 +53,11 @@ find_exec_dir() {
         mkdir -p "$dir" 2>/dev/null || continue
         [[ ! -w "$dir" ]] && continue
 
-        # 顺手清理可能因历史断电/强杀遗留超过 1 天的旧临时目录
         find "$dir" -maxdepth 1 -type d -name "superbench.*" -mtime +1 -exec rm -rf {} + 2>/dev/null || true
 
         test_dir=$(mktemp -d "$dir/superbench.XXXXXX" 2>/dev/null) || continue
         chmod 700 "$test_dir" 2>/dev/null
 
-        # 实际写入微型脚本并执行，100% 规避 noexec 挂载限制
         test_bin="$test_dir/.exec_check.sh"
         printf "#!/bin/sh\nexit 0\n" > "$test_bin" 2>/dev/null
         chmod 700 "$test_bin" 2>/dev/null
@@ -112,12 +109,10 @@ init_log_file() {
     chmod 600 "$LOG_FILE" "$SPEED_LOG" 2>/dev/null
 }
 
-# 安全退出清理函数（先杀子进程释放文件锁，再彻底删除隔离目录）
+# 安全退出清理函数
 cleanup() {
-    # 卸载 trap 防止重复触发
     trap - EXIT INT TERM HUP QUIT
 
-    # 终止可能还在后台写文件的子进程（如 speedtest / dd）
     pkill -P $$ >/dev/null 2>&1 || true
 
     [[ -n "$IO_DIR" && -d "$IO_DIR" ]] && rm -f "$IO_DIR"/sb_io_test_$$_* 2>/dev/null
@@ -170,7 +165,6 @@ benchinit() {
     find_io_dir
     init_log_file
 
-    # 检查并按需安装基础工具（移除 Python 依赖）
     for cmd in curl wget tar; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             echo " 正在安装基础组件: $cmd ..."
@@ -184,16 +178,16 @@ benchinit() {
     fi
 }
 
-# 通用文件下载封装（强制校验证书，支持超时与重试）
 download_file() {
     local url=$1
     local output=$2
+    local timeout_sec=${3:-45}
     local ua="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
     if command -v curl >/dev/null 2>&1; then
-        curl -4 -fsSL -A "$ua" --retry 2 --connect-timeout 10 --max-time 60 -o "$output" "$url" 2>/dev/null \
-            || curl -fsSL -A "$ua" --retry 1 --connect-timeout 10 --max-time 60 -o "$output" "$url" 2>/dev/null
+        curl -4 -fsSL -A "$ua" --retry 1 --connect-timeout 6 --max-time "$timeout_sec" -o "$output" "$url" 2>/dev/null \
+            || curl -fsSL -A "$ua" --retry 1 --connect-timeout 6 --max-time "$timeout_sec" -o "$output" "$url" 2>/dev/null
     else
-        wget -q -U "$ua" --tries=2 --timeout=15 -O "$output" "$url" 2>/dev/null
+        wget -q -U "$ua" --tries=2 --timeout=10 -O "$output" "$url" 2>/dev/null
     fi
 }
 
@@ -494,8 +488,9 @@ print_io() {
 }
 
 # ======================== 现代化网络测速模块 ========================
-# 策略：海外/国际采用 Fast.com (Netflix) + Cloudflare CDN + 本地最优节点
-#       国内采用 西安 / 北京 / 上海 / 广东 四大区域动态搜索 + 多节点容灾池
+# 1. 国际/本地基准：Speedtest Default + Fast.com (Netflix) + Cloudflare CDN
+# 2. 中国四区回程：接入每日更新的 speedtest.cn 节点库 (西安 / 北京 / 上海 / 广东)
+#    采用 6 线程并发毫秒级探活 + 原生 HTTP 多线程上传/下载，彻底解决跨国锁区与节点失效
 
 install_speedtest() {
     local st_bin="$WORK_DIR/speedtest"
@@ -507,16 +502,13 @@ install_speedtest() {
         aarch64|arm64)  arch_tag="aarch64" ;;
         armv7l|armhf)   arch_tag="armhf" ;;
         i386|i686)      arch_tag="i386" ;;
-        *)
-            echo -e "${YELLOW}[提示] 当前架构 $(uname -m) 无官方 Speedtest 二进制包，将使用 HTTP 测速。${PLAIN}"
-            return 1
-            ;;
+        *)              return 1 ;;
     esac
 
     local url="https://install.speedtest.net/app/cli/ookla-speedtest-${SPEEDTEST_VER}-linux-${arch_tag}.tgz"
     local tgz="$WORK_DIR/speedtest.tgz"
 
-    if download_file "$url" "$tgz"; then
+    if download_file "$url" "$tgz" 30; then
         tar -xzf "$tgz" -C "$WORK_DIR" >/dev/null 2>&1
         chmod 700 "$st_bin" 2>/dev/null
         rm -f "$tgz"
@@ -525,35 +517,31 @@ install_speedtest() {
     return 1
 }
 
-# 纯 Bash 实现 Fast.com (Netflix OCA CDN) 多线程并发测速（无需 Python）
+# 纯 Bash 实现 Fast.com (Netflix OCA CDN) 3 线程并发测速
 speed_fast_com() {
     command -v curl >/dev/null 2>&1 || return 1
 
     local ua="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
     local js_name token=""
 
-    # 1. 动态获取 Fast.com JS Token，失败则回退到官方固定 Public Token
     js_name=$(curl -4 -fsSL -A "$ua" --max-time 5 "https://fast.com" 2>/dev/null | grep -oE 'app-[a-f0-9]+\.js' | head -n1)
     if [[ -n "$js_name" ]]; then
         token=$(curl -4 -fsSL -A "$ua" --max-time 5 "https://fast.com/${js_name}" 2>/dev/null | grep -oE 'token:"[^"]+"' | head -n1 | cut -d'"' -f2)
     fi
     [[ -z "$token" ]] && token="YXNkZmFzZGxmbnNkYWZoYXNkZmhrYWxm"
 
-    # 2. 请求 Netflix Speedtest v2 接口获取分配的 OCA 测速节点 URL
     local api_json urls first_url
     api_json=$(curl -4 -fsSL -A "$ua" --max-time 6 "https://api.fast.com/netflix/speedtest/v2?https=true&token=${token}&urlCount=3" 2>/dev/null)
     urls=$(echo "$api_json" | grep -oE 'https://[^"]+' | head -n 3)
     first_url=$(echo "$urls" | head -n 1)
     [[ -z "$first_url" ]] && return 1
 
-    # 3. 测量到 Netflix CDN 节点的真实连接延迟
     local lat_sec lat_ms="N/A"
     lat_sec=$(curl -4 -o /dev/null -s -w "%{time_connect}" --connect-timeout 5 "$first_url" 2>/dev/null)
     if [[ -n "$lat_sec" ]]; then
         lat_ms=$(awk -v s="$lat_sec" 'BEGIN {if (s>0) printf "%.2f ms", s * 1000; else print "N/A"}')
     fi
 
-    # 4. 3 线程并发拉取 Netflix OCA 流并汇总下载速率
     local total_bps dl_mbps="0.00"
     total_bps=$(echo "$urls" | xargs -P 3 -I {} curl -4 -sSL -A "$ua" -w "%{speed_download}\n" --connect-timeout 5 --max-time 8 -o /dev/null "{}" 2>/dev/null | awk '{sum += $1} END {print sum}')
     if [[ -n "$total_bps" ]]; then
@@ -598,15 +586,15 @@ speed_cloudflare_cdn() {
     return 1
 }
 
-# 单节点 Ookla Speedtest 测速执行器
-speed_test() {
+# Ookla Speedtest 测速执行器（用于本地最优节点）
+speed_test_ookla() {
     local node_id=$1
     local node_name=$2
     local st_bin="$WORK_DIR/speedtest"
     [[ ! -x "$st_bin" ]] && return 1
 
     local cmd_prefix=()
-    command -v timeout >/dev/null 2>&1 && cmd_prefix=(timeout 40)
+    command -v timeout >/dev/null 2>&1 && cmd_prefix=(timeout 35)
 
     if [[ -z "$node_id" ]]; then
         HOME="$WORK_DIR" "${cmd_prefix[@]}" "$st_bin" -p no --accept-license --accept-gdpr > "$SPEED_LOG" 2>&1
@@ -633,220 +621,228 @@ speed_test() {
     return 1
 }
 
-# 根据 Sponsor / Host 自动识别中国三大运营商标识 (CT/CU/CM)
-detect_cn_isp_tag() {
-    local raw_info=$1
-    local info_lc
-    info_lc=$(echo "$raw_info" | tr '[:upper:]' '[:lower:]')
+# 下载每日自动更新的 speedtest.cn 中国大陆三网节点库 (telecom / unicom / mobile)
+init_cn_node_db() {
+    local db_file="$WORK_DIR/cn_nodes_all.csv"
+    [[ -s "$db_file" ]] && return 0
 
-    if [[ "$info_lc" == *"telecom"* || "$info_lc" == *"chinanet"* || "$info_lc" == *"163"* || "$info_lc" == *"189"* || "$raw_info" == *"电信"* ]]; then
-        echo "CT"
-    elif [[ "$info_lc" == *"unicom"* || "$info_lc" == *"10010"* || "$raw_info" == *"联通"* ]]; then
-        echo "CU"
-    elif [[ "$info_lc" == *"mobile"* || "$info_lc" == *"cmcc"* || "$info_lc" == *"10086"* || "$raw_info" == *"移动"* ]]; then
-        echo "CM"
-    else
-        echo "5G"
-    fi
+    local mirrors=(
+        "https://raw.githubusercontent.com/spiritLHLS/speedtest.cn-CN-ID/main"
+        "https://cdn.jsdelivr.net/gh/spiritLHLS/speedtest.cn-CN-ID@main"
+        "https://cdn.spiritlhl.net/https://raw.githubusercontent.com/spiritLHLS/speedtest.cn-CN-ID/main"
+    )
+
+    local isp_files=("telecom.csv:CT" "unicom.csv:CU" "mobile.csv:CM")
+    : > "$db_file"
+
+    local item fname isp_tag mirror tmp_csv
+    for item in "${isp_files[@]}"; do
+        fname="${item%%:*}"
+        isp_tag="${item#*:}"
+        tmp_csv="$WORK_DIR/$fname"
+
+        for mirror in "${mirrors[@]}"; do
+            if download_file "${mirror}/${fname}" "$tmp_csv" 10 && [[ -s "$tmp_csv" ]]; then
+                # 解析 CSV 行，提取：ISP|省市|pingUrl|downloadUrl|uploadUrl
+                awk -F',' -v isp="$isp_tag" '
+                NR > 1 {
+                    prov=$8; city=$9;
+                    gsub(/^[ \t\r"]+|[ \t\r"]+$/, "", prov);
+                    gsub(/^[ \t\r"]+|[ \t\r"]+$/, "", city);
+                    ping=""; dl=""; ul="";
+                    for (i=1; i<=NF; i++) {
+                        gsub(/^[ \t\r"]+|[ \t\r"]+$/, "", $i);
+                        if ($i ~ /^https?:\/\/.*\/hello$/) ping=$i;
+                        else if ($i ~ /^https?:\/\/.*\/download$/) dl=$i;
+                        else if ($i ~ /^https?:\/\/.*\/upload$/) ul=$i;
+                    }
+                    if (ping != "" && dl != "" && ul != "") {
+                        printf "%s|%s|%s|%s|%s|%s\n", isp, prov, city, ping, dl, ul;
+                    }
+                }' "$tmp_csv" >> "$db_file"
+                rm -f "$tmp_csv"
+                break
+            fi
+        done
+    done
+
+    # 生成 4MB 标准上传载荷文件（使 curl 携带准确的 Content-Length 头，解决 :8080/upload 0.00 速率问题）
+    dd if=/dev/zero of="$WORK_DIR/upload_payload.bin" bs=256K count=16 >/dev/null 2>&1 || true
+
+    # 生成单节点并发探活小脚本（在 WORK_DIR 内安全执行，彻底规避复杂的引号转义）
+    cat << 'EOF' > "$WORK_DIR/probe_cn.sh"
+#!/usr/bin/env bash
+IFS='|' read -r isp prov city ping_u dl_u ul_u <<< "$1"
+[[ -z "$ping_u" ]] && exit 0
+res=$(curl -4 -k -s -o /dev/null -w "%{http_code} %{time_connect}" --connect-timeout 2 --max-time 3 "$ping_u" 2>/dev/null)
+code=${res%% *}
+tconn=${res#* }
+if [[ "$code" == "200" || "$code" == "204" ]]; then
+    printf "%s|%s|%s|%s|%s|%s\n" "$isp" "$prov" "$city" "$tconn" "$dl_u" "$ul_u"
+fi
+EOF
+    chmod 700 "$WORK_DIR/probe_cn.sh"
+
+    [[ -s "$db_file" ]] && return 0 || return 1
 }
 
-# 动态从 Ookla 官方搜索 API 获取指定中国城市的实时可用节点，并合并内置容灾节点池
-# 参数: $1=展示城市名, $2=搜索关键词列表(逗号分隔), $3=内置兜底列表(ID:ISP格式,空格分隔), $4=期望成功测速节点数
-test_cn_region() {
-    local region_label=$1
-    local search_keys=$2
-    local fallback_list=$3
-    local max_success=${4:-2}
+# 对单个通过探活的国内 speedtest.cn 节点执行 HTTP 多线程下载与上传测速
+run_cn_http_test() {
+    local display_name=$1
+    local tconn=$2
+    local dl_u=$3
+    local ul_u=$4
 
-    local candidates=()
-    local seen_ids=" "
     local ua="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    local payload="$WORK_DIR/upload_payload.bin"
 
-    # 1. 实时查询 Speedtest 官方 API 获取当前在线的该地区节点
-    if command -v curl >/dev/null 2>&1; then
-        local kw api_res line sid sponsor host isp_tag
-        IFS=',' read -ra kw_arr <<< "$search_keys"
-        for kw in "${kw_arr[@]}"; do
-            api_res=$(curl -4 -fsSL -A "$ua" --max-time 5 "https://www.speedtest.net/api/js/servers?engine=js&https_functional=true&limit=15&search=${kw}" 2>/dev/null)
-            [[ -z "$api_res" ]] && continue
+    local lat_ms
+    lat_ms=$(awk -v s="$tconn" 'BEGIN {if (s>0) printf "%.2f", s * 1000; else print "N/A"}')
 
-            while IFS= read -r line; do
-                [[ -z "$line" ]] && continue
-                sid=$(echo "$line" | grep -oE '"id"[[:space:]]*:[[:space:]]*"?[0-9]+"?' | head -n1 | grep -oE '[0-9]+')
-                [[ -z "$sid" || "$seen_ids" == *" $sid "* ]] && continue
+    # 1. 双线程并发下载测速 (请求 25MB 数据流，限时 8 秒)
+    local dl_stats total_bytes total_bps dl_mbps="0.00"
+    dl_stats=$(printf "%s\n%s\n" "${dl_u}?size=25000000" "${dl_u}?size=25000000" | xargs -P 2 -I {} curl -4 -k -sSL -A "$ua" -w "%{size_download} %{speed_download}\n" --connect-timeout 3 --max-time 8 -o /dev/null "{}" 2>/dev/null)
+    total_bytes=$(echo "$dl_stats" | awk '{sum += $1} END {print sum+0}')
+    total_bps=$(echo "$dl_stats" | awk '{sum += $2} END {print sum+0}')
 
-                sponsor=$(echo "$line" | grep -oE '"sponsor"[[:space:]]*:[[:space:]]*"[^"]*"' | head -n1 | sed -E 's/"sponsor"[[:space:]]*:[[:space:]]*"([^"]*)"/\1/')
-                host=$(echo "$line" | grep -oE '"host"[[:space:]]*:[[:space:]]*"[^"]*"' | head -n1 | sed -E 's/"host"[[:space:]]*:[[:space:]]*"([^"]*)"/\1/')
-                isp_tag=$(detect_cn_isp_tag "$sponsor $host")
+    # 校验实际下载字节数 > 64KB，排除假 200 拦截页
+    if [[ "$total_bytes" -lt 65536 ]]; then
+        return 1
+    fi
+    dl_mbps=$(awk -v bps="$total_bps" 'BEGIN {printf "%.2f", (bps * 8) / 1000000}')
+    [[ $(awk -v m="$dl_mbps" 'BEGIN {print (m > 0.05) ? 1 : 0}') -eq 0 ]] && return 1
 
-                seen_ids+="$sid "
-                candidates+=("${sid}:${isp_tag}")
-            done < <(echo "$api_res" | sed 's/},{/}\n{/g' | grep '"cc":"CN"')
-        done
+    # 2. 双线程并发上传测速 (发送带 Content-Length 的 4MB 载荷，限时 7 秒)
+    local ul_stats up_bps up_mbps="0.00"
+    if [[ -f "$payload" ]]; then
+        ul_stats=$(printf "%s\n%s\n" "$ul_u" "$ul_u" | xargs -P 2 -I {} curl -4 -k -sSL -A "$ua" -w "%{speed_upload}\n" --connect-timeout 3 --max-time 7 -o /dev/null -H "Content-Type: application/octet-stream" --data-binary @"$payload" "{}" 2>/dev/null)
+        up_bps=$(echo "$ul_stats" | awk '{sum += $1} END {print sum+0}')
+        up_mbps=$(awk -v bps="$up_bps" 'BEGIN {printf "%.2f", (bps * 8) / 1000000}')
     fi
 
-    # 2. 追加内置的多运营商静态备用节点池（防止 API 限流或搜索为空）
-    local item fb_id fb_isp
-    for item in $fallback_list; do
-        fb_id="${item%%:*}"
-        fb_isp="${item#*:}"
-        if [[ -n "$fb_id" && "$seen_ids" != *" $fb_id "* ]]; then
-            seen_ids+="$fb_id "
-            candidates+=("${fb_id}:${fb_isp}")
-        fi
+    printf "${YELLOW}%-22s${GREEN}%-16s${RED}%-18s${SKYBLUE}%-12s${PLAIN}\n" " ${display_name:0:20}" "${up_mbps} Mbit/s" "${dl_mbps} Mbit/s" "${lat_ms} ms" | tee -a "$LOG_FILE"
+    return 0
+}
+
+# 按大区测试中国节点：先匹配核心城市，若该市节点对海外 IP 封锁则自动扩充同大区邻近省份
+# 参数: $1=区域展示标签, $2=首选城市正则, $3=同大区替补省市正则, $4=期望测速成功数
+test_cn_region_http() {
+    local region_label=$1
+    local primary_regex=$2
+    local fallback_regex=$3
+    local max_success=${4:-2}
+    local db_file="$WORK_DIR/cn_nodes_all.csv"
+    [[ ! -s "$db_file" ]] && return 1
+
+    # 从 CT/CU/CM 中均匀抽取候选节点（首选城市在前，同大区替补在后）
+    local raw_candidates=""
+    local isp
+    for isp in CT CU CM; do
+        raw_candidates+=$(grep "^${isp}|" "$db_file" | grep -E "$primary_regex" | head -n 5)$'\n'
+    done
+    for isp in CT CU CM; do
+        raw_candidates+=$(grep "^${isp}|" "$db_file" | grep -E "$fallback_regex" | head -n 4)$'\n'
     done
 
-    # 3. 优先挑选不同运营商 (CT/CU/CM) 进行测速，失败则自动顺延尝试下一个候选节点
+    raw_candidates=$(echo "$raw_candidates" | awk 'NF > 0 && !seen[$0]++')
+    [[ -z "$raw_candidates" ]] && return 1
+
+    # 6 线程并发对候选节点进行 2 秒快速 HTTP 探活，瞬间滤除死节点或锁区节点
+    local alive_nodes
+    alive_nodes=$(echo "$raw_candidates" | head -n 24 | xargs -P 6 -I {} "$WORK_DIR/probe_cn.sh" "{}" 2>/dev/null)
+    [[ -z "$alive_nodes" ]] && return 1
+
     local success_count=0
     local tested_isps=" "
-    local tested_ids=" "
-    local entry cid cisp display_name
+    local tested_urls=" "
+    local line c_isp c_prov c_city c_tconn c_dl c_ul label
 
-    # 第一轮：优先覆盖不同运营商
-    for entry in "${candidates[@]}"; do
+    # 第一轮：优先测试不同运营商 (CT / CU / CM)
+    while IFS='|' read -r c_isp c_prov c_city c_tconn c_dl c_ul; do
+        [[ -z "$c_dl" ]] && continue
         [[ $success_count -ge $max_success ]] && break
-        cid="${entry%%:*}"
-        cisp="${entry#*:}"
-        [[ "$tested_isps" == *" $cisp "* ]] && continue
+        [[ "$tested_isps" == *" $c_isp "* ]] && continue
 
-        display_name=$(printf "%-12s %s" "$region_label" "$cisp")
-        tested_ids+="$cid "
-        if speed_test "$cid" "$display_name"; then
-            tested_isps+="$cisp "
+        label=$(printf "%-13s %s" "$region_label" "$c_isp")
+        tested_urls+="$c_dl "
+        if run_cn_http_test "$label" "$c_tconn" "$c_dl" "$c_ul"; then
+            tested_isps+="$c_isp "
             ((++success_count))
         fi
-    done
+    done <<< "$alive_nodes"
 
-    # 第二轮：若未达到目标数量，继续从剩余节点补齐
-    for entry in "${candidates[@]}"; do
+    # 第二轮：若未达到期望节点数，从剩余存活节点中补齐
+    while IFS='|' read -r c_isp c_prov c_city c_tconn c_dl c_ul; do
+        [[ -z "$c_dl" ]] && continue
         [[ $success_count -ge $max_success ]] && break
-        cid="${entry%%:*}"
-        cisp="${entry#*:}"
-        [[ "$tested_ids" == *" $cid "* ]] && continue
+        [[ "$tested_urls" == *" $c_dl "* ]] && continue
 
-        display_name=$(printf "%-12s %s" "$region_label" "$cisp")
-        tested_ids+="$cid "
-        if speed_test "$cid" "$display_name"; then
+        label=$(printf "%-13s %s" "$region_label" "$c_isp")
+        tested_urls+="$c_dl "
+        if run_cn_http_test "$label" "$c_tconn" "$c_dl" "$c_ul"; then
             ((++success_count))
         fi
-    done
+    done <<< "$alive_nodes"
 
-    return $(( success_count > 0 ? 0 : 1 ))
+    [[ $success_count -gt 0 ]] && return 0 || return 1
 }
 
 # 运行中国四大重点区域（西安、北京、上海、广东）测速
 run_china_speedtest() {
     local nodes_per_region=${1:-2}
-    local st_bin="$WORK_DIR/speedtest"
-    [[ ! -x "$st_bin" ]] && return 1
-
     local total_cn_success=0
 
-    # 1. 西安节点 (西北枢纽: 陕西移动 / 西安联通 / 陕西电信)
-    test_cn_region "CN Xi'an"     "Xian,Shaanxi"            "29105:CM 4863:CU 5292:CM 3633:CT"          "$nodes_per_region" && ((++total_cn_success))
+    if init_cn_node_db; then
+        # 1. 西安 / 西北节点 (首选陕西/西安，同区替补甘肃/宁夏/河南/四川)
+        test_cn_region_http "CN Xi'an"     "西安|咸阳|陕西"           "兰州|甘肃|银川|宁夏|郑州|河南|成都|重庆" "$nodes_per_region" && ((++total_cn_success))
 
-    # 2. 北京节点 (华北枢纽: 北京联通 / 北京移动 / 北京电信)
-    test_cn_region "CN Beijing"   "Beijing"                 "43752:CU 25858:CM 5145:CU 4751:CT 4713:CM" "$nodes_per_region" && ((++total_cn_success))
+        # 2. 北京 / 华北节点 (首选北京，同区替补天津/河北/山东/辽宁)
+        test_cn_region_http "CN Beijing"   "北京"                     "天津|石家庄|河北|保定|济南|青岛|山东|沈阳" "$nodes_per_region" && ((++total_cn_success))
 
-    # 3. 上海节点 (华东枢纽: 上海联通5G / 上海电信 / 上海移动)
-    test_cn_region "CN Shanghai"  "Shanghai"                "24447:CU 5083:CU 3633:CT 25637:CM"         "$nodes_per_region" && ((++total_cn_success))
+        # 3. 上海 / 华东节点 (首选上海，同区替补江苏苏州/南京/镇江/浙江杭州/宁波)
+        test_cn_region_http "CN Shanghai"  "上海"                     "苏州|南京|镇江|无锡|昆山|江苏|杭州|宁波|浙江|合肥" "$nodes_per_region" && ((++total_cn_success))
 
-    # 4. 广东节点 (华南枢纽: 广州/深圳 电信 / 移动 / 联通)
-    test_cn_region "CN Guangdong" "Guangzhou,Shenzhen"      "60584:CT 60794:CM 27594:CT 26678:CU 17251:CT" "$nodes_per_region" && ((++total_cn_success))
-
-    [[ $total_cn_success -gt 0 ]] && return 0 || return 1
-}
-
-# 当 Ookla 完全不可用时，使用开源 LibreSpeed CLI 兜底
-run_librespeed_fallback() {
-    local ls_bin="$WORK_DIR/librespeed-cli"
-    local ls_ver="1.0.11"
-    local arch_tag=""
-
-    case "$(uname -m)" in
-        x86_64|amd64)   arch_tag="amd64" ;;
-        aarch64|arm64)  arch_tag="arm64" ;;
-        armv7l|armhf)   arch_tag="armv7" ;;
-        i386|i686)      arch_tag="386" ;;
-        *)              return 1 ;;
-    esac
-
-    if [[ ! -x "$ls_bin" ]]; then
-        local url="https://github.com/librespeed/speedtest-cli/releases/download/v${ls_ver}/librespeed-cli_${ls_ver}_linux_${arch_tag}.tar.gz"
-        local tgz="$WORK_DIR/librespeed.tgz"
-        if download_file "$url" "$tgz"; then
-            tar -xzf "$tgz" -C "$WORK_DIR" >/dev/null 2>&1
-            chmod 700 "$ls_bin" 2>/dev/null
-            rm -f "$tgz"
-        fi
+        # 4. 广东 / 华南节点 (首选广州/深圳/广东，同区替补福建/湖南/广西)
+        test_cn_region_http "CN Guangdong" "广州|深圳|东莞|佛山|广东" "福州|厦门|泉州|福建|长沙|湖南|南宁|广西" "$nodes_per_region" && ((++total_cn_success))
     fi
 
-    [[ ! -x "$ls_bin" ]] && return 1
+    # 若遇到极端情况 CSV 下载失败，回退尝试 Ookla 仅存的国内大区节点
+    if [[ $total_cn_success -eq 0 && -x "$WORK_DIR/speedtest" ]]; then
+        speed_test_ookla "43752" "CN Beijing    CU" && ((++total_cn_success))
+        speed_test_ookla "24447" "CN Shanghai   CU" && ((++total_cn_success))
+        speed_test_ookla "5396"  "CN Suzhou     CT" && ((++total_cn_success))
+        speed_test_ookla "59387" "CN Ningbo     CT" && ((++total_cn_success))
+    fi
 
-    local cmd_prefix=()
-    command -v timeout >/dev/null 2>&1 && cmd_prefix=(timeout 60)
-
-    local out
-    out=$("${cmd_prefix[@]}" "$ls_bin" --csv --concurrent 3 2>/dev/null)
-    [[ -z "$out" ]] && return 1
-
-    local count=0
-    while IFS= read -r line; do
-        [[ -z "$line" ]] && continue
-        # 先将双引号内的逗号替换为空格，防止城市名带逗号导致 awk 列错位
-        local clean_line sname lat dl up
-        clean_line=$(echo "$line" | awk -F'"' -v OFS='' '{for (i=2; i<=NF; i+=2) gsub(/,/, " ", $i)} 1')
-        sname=$(echo "$clean_line" | awk -F',' '{print substr($2, 1, 20)}')
-        lat=$(echo "$clean_line"   | awk -F',' '{print $5}')
-        dl=$(echo "$clean_line"    | awk -F',' '{print $7}')
-        up=$(echo "$clean_line"    | awk -F',' '{print $8}')
-        if [[ -n "$dl" && "$dl" =~ ^[0-9.]+$ ]]; then
-            printf "${YELLOW}%-22s${GREEN}%-16s${RED}%-18s${SKYBLUE}%-12s${PLAIN}\n" " ${sname:-LibreSpeed}" "${up:-0.00} Mbit/s" "${dl} Mbit/s" "${lat:-N/A} ms" | tee -a "$LOG_FILE"
-            ((++count))
-        fi
-    done <<< "$out"
-
-    [[ $count -gt 0 ]] && return 0 || return 1
+    [[ $total_cn_success -gt 0 ]] && return 0 || return 1
 }
 
 print_speedtest() {
     printf "%-22s%-16s%-18s%-12s\n" " Node Name" "Upload Speed" "Download Speed" "Latency" | tee -a "$LOG_FILE"
 
-    local has_ookla=0
-    install_speedtest && has_ookla=1
-
     # 1. 海外与国际主流 CDN 测速 (本地最优 + Fast.com + Cloudflare CDN)
-    if [[ $has_ookla -eq 1 ]]; then
-        speed_test '' 'Speedtest Default' || true
+    if install_speedtest; then
+        speed_test_ookla '' 'Speedtest Default' || true
     fi
     speed_fast_com || true
     speed_cloudflare_cdn || true
 
-    # 2. 中国四大核心区域测速 (西安 / 北京 / 上海 / 广东，标准模式每区测 2 个节点)
-    if [[ $has_ookla -eq 1 ]]; then
-        run_china_speedtest 2 || run_librespeed_fallback || true
-    else
-        run_librespeed_fallback || true
-    fi
+    # 2. 中国四大核心区域测速 (西安 / 北京 / 上海 / 广东，标准模式每区测 2 个不同运营商节点)
+    run_china_speedtest 2 || true
 }
 
 print_speedtest_fast() {
     printf "%-22s%-16s%-18s%-12s\n" " Node Name" "Upload Speed" "Download Speed" "Latency" | tee -a "$LOG_FILE"
 
-    local has_ookla=0
-    install_speedtest && has_ookla=1
-
     # 1. 海外与国际主流 CDN 测速
-    if [[ $has_ookla -eq 1 ]]; then
-        speed_test '' 'Speedtest Default' || true
+    if install_speedtest; then
+        speed_test_ookla '' 'Speedtest Default' || true
     fi
     speed_fast_com || true
     speed_cloudflare_cdn || true
 
     # 2. 中国四大核心区域快速测速 (西安 / 北京 / 上海 / 广东，快速模式每区测 1 个节点)
-    if [[ $has_ookla -eq 1 ]]; then
-        run_china_speedtest 1 || true
-    fi
+    run_china_speedtest 1 || true
 }
 
 # ======================== 时间统计与结果分享 ========================
