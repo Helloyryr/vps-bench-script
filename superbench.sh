@@ -569,36 +569,33 @@ speed_test() {
 }
 
 
-# 自动从 Speedtest 官方列表获取当前服务器附近可用的节点进行测试
 run_dynamic_speedtest() {
-    local max_nodes=${1:-5}
+    # 动态节点数量建议设为 2~3 个即可
+    local max_nearby=${1:-2}
     local st_bin="$WORK_DIR/speedtest"
     [[ ! -x "$st_bin" ]] && return
 
-    # 1. 先跑默认最优节点
-    speed_test '' 'Speedtest Auto'
-
-    # 2. 尝试常用国内外及亚太重点节点（存活则输出，失效自动跳过）
-    speed_test '5396'  'Suzhou 5G    CT'
+    # 1. 国内三网固定节点（国内 VPS 必测，国外机器可看回国速度）
     speed_test '24447' 'Shanghai 5G  CU'
+    speed_test '5396'  'Suzhou 5G    CT'
     speed_test '25858' 'Beijing      CM'
-    speed_test '32291' 'HongKong     CN'
-    speed_test '13623' 'Singapore    SG'
-    speed_test '48463' 'Tokyo        JP'
 
-    # 3. 动态拉取当前 VPS 附近真实在线的节点补充测试（防止固定节点全部失效）
+    # 2. 国际/亚太常用节点（可按需只留 1-2 个热门）
+    speed_test '32291' 'HongKong     CN'
+
+    # 3. 动态拉取机器本地附近的节点（跳过第1个，避免与Auto重复，只取2个）
     local server_list
     server_list=$("$st_bin" -L --accept-license --accept-gdpr 2>/dev/null | awk '/^[[:space:]]*[0-9]+[[:space:]]+/ {
         id=$1;
         $1="";
         gsub(/^[[:space:]]+/, "", $0);
         printf "%s|%s\n", id, substr($0, 1, 15)
-    }' | head -n "$max_nodes")
+    }' | head -n "$max_nearby")
 
     local line sid sname
     while IFS='|' read -r sid sname; do
         [[ -z "$sid" ]] && continue
-        speed_test "$sid" "$sname"
+        speed_test "$sid" "Nearby: $sname"
     done <<< "$server_list"
 }
 
@@ -623,7 +620,8 @@ print_speedtest_fast() {
 
 print_intro() {
     printf " Superbench.sh -- Modernized Edition v%s\n" "$VERSION" | tee -a "$LOG_FILE"
-    printf " Mode  : ${GREEN}%s${PLAIN}    WorkDir : ${SKYBLUE}%s${PLAIN}\n" "${MODE_NAME:-Standard}" "$WORK_DIR" | tee -a "$LOG_FILE"
+    printf " Thanks  : Special thanks to ${SKYBLUE}Oldking${PLAIN} (oldking.net) & ${SKYBLUE}Teddysun${PLAIN} (teddysun.com)\n" | tee -a "$LOG_FILE"
+    printf " Mode    : ${GREEN}%s${PLAIN}    WorkDir : ${SKYBLUE}%s${PLAIN}\n" "${MODE_NAME:-Standard}" "$WORK_DIR" | tee -a "$LOG_FILE"
 }
 
 print_end_time() {
