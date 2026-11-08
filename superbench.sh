@@ -184,10 +184,12 @@ benchinit() {
 download_file() {
     local url=$1
     local output=$2
+    local ua="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSL --retry 2 --connect-timeout 10 --max-time 60 -o "$output" "$url" 2>/dev/null
+        curl -4 -fsSL -A "$ua" --retry 2 --connect-timeout 10 --max-time 60 -o "$output" "$url" 2>/dev/null \
+            || curl -fsSL -A "$ua" --retry 1 --connect-timeout 10 --max-time 60 -o "$output" "$url" 2>/dev/null
     else
-        wget -q --tries=2 --timeout=15 -O "$output" "$url" 2>/dev/null
+        wget -q -U "$ua" --tries=2 --timeout=15 -O "$output" "$url" 2>/dev/null
     fi
 }
 
@@ -625,12 +627,62 @@ run_dynamic_speedtest() {
 
 print_speedtest() {
     printf "%-22s%-16s%-18s%-12s\n" " Node Name" "Upload Speed" "Download Speed" "Latency" | tee -a "$LOG_FILE"
-    if install_speedtest; then
-        # 如果你想每次都测 Cloudflare，把下面的 || 改成 ; 即可
-        run_dynamic_speedtest 3 || speed_cloudflare_fallback
+    if install_speedtest && run_dynamic_speedtest 3; then
+        speed_cloudflare_fallback
     else
+        run_librespeed_fallback
         speed_cloudflare_fallback
     fi
+}
+
+
+# 当 Ookla 被机房墙/403 拦截时，使用开源 LibreSpeed CLI 进行多节点测速
+run_librespeed_fallback() {
+    local ls_bin="$WORK_DIR/librespeed-cli"
+    local ls_ver="1.0.11"
+    local arch_tag=""
+
+    case "$(uname -m)" in
+        x86_64|amd64)   arch_tag="amd64" ;;
+        aarch64|arm64)  arch_tag="arm64" ;;
+        armv7l|armhf)   arch_tag="armv7" ;;
+        i386|i686)      arch_tag="386" ;;
+        *)              return 1 ;;
+    esac
+
+    if [[ ! -x "$ls_bin" ]]; then
+        local url="https://github.com/librespeed/speedtest-cli/releases/download/v${ls_ver}/librespeed-cli_${ls_ver}_linux_${arch_tag}.tar.gz"
+        local tgz="$WORK_DIR/librespeed.tgz"
+        if download_file "$url" "$tgz"; then
+            tar -xzf "$tgz" -C "$WORK_DIR" >/dev/null 2>&1
+            chmod 700 "$ls_bin" 2>/dev/null
+            rm -f "$tgz"
+        fi
+    fi
+
+    [[ ! -x "$ls_bin" ]] && return 1
+
+    # 自动测速最近的 3 个 LibreSpeed 节点，输出 CSV 格式便于 awk 解析
+    local out
+    out=$(timeout 60 "$ls_bin" --csv --concurrent 3 2>/dev/null)
+    [[ -z "$out" ]] && return 1
+
+    local count=0
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        local sname lat dl up
+        # CSV 字段参考: id,name,location,ping,jitter,download,upload,...
+        sname=$(echo "$line" | awk -F',' '{gsub(/"/, "", $2); print substr($2, 1, 20)}')
+        lat=$(echo "$line"   | awk -F',' '{print $5}')
+        dl=$(echo "$line"    | awk -F',' '{print $7}')
+        up=$(echo "$line"    | awk -F',' '{print $8}')
+        if [[ -n "$dl" && "$dl" =~ ^[0-9.]+$ ]]; then
+            printf "${YELLOW}%-22s${GREEN}%-16s${RED}%-18s${SKYBLUE}%-12s${PLAIN}\n" " ${sname:-LibreSpeed}" "${up:-0.00} Mbit/s" "${dl} Mbit/s" "${lat:-N/A} ms" | tee -a "$LOG_FILE"
+            ((count++))
+        fi
+    done <<< "$out"
+
+    [[ $count -gt 0 ]] && return 0 || return 1
 }
 
 print_speedtest_fast() {
