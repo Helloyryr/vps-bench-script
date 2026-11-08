@@ -3,7 +3,7 @@
 # Description : Modernized Cross-Platform System Info, I/O & Network Benchmark Script
 # Based on    : Superbench.sh by Oldking & Bench.sh by Teddysun
 # License     : MIT License
-# Version     : v2.0.0
+# Version     : v2.1.0
 #
 
 # 开启管道错误传递，未定义变量在关键处手动校验以保证兼容性
@@ -16,7 +16,7 @@ YELLOW='\033[0;33m'
 SKYBLUE='\033[0;36m'
 PLAIN='\033[0m'
 
-VERSION="2.0.0"
+VERSION="2.1.0"
 SPEEDTEST_VER="1.2.0"
 START_TIME=$(date +%s)
 
@@ -40,13 +40,12 @@ check_privilege() {
         SUDO_CMD="sudo"
     else
         HAS_ROOT=0
-        echo -e "${YELLOW}[提示] 当前非 Root 用户且无免密 sudo，将跳过系统级依赖安装与 SMART 检测，以用户态运行。${PLAIN}"
+        echo -e "${YELLOW}[提示] 当前非 Root 用户且无免密 sudo，将跳过系统级依赖安装，以用户态运行。${PLAIN}"
     fi
 }
 
 # 寻找既【可写】又【允许执行二进制 (非 noexec)】的临时工作目录
 find_exec_dir() {
-    # 优先使用 /tmp（系统重启可自动回收），若受 noexec 限制再自动回退到 /var/tmp
     local candidates=("/tmp" "/var/tmp" "${HOME:-/tmp}/.cache" "$PWD")
     local dir test_dir test_bin
 
@@ -100,9 +99,13 @@ find_io_dir() {
     IO_DIR="$WORK_DIR"
 }
 
-# 安全初始化日志文件（直接放入 WORK_DIR，跑完自动通过 paste.rs 分享并随目录销毁，不污染当前目录）
+# 安全初始化日志文件（结果日志保存在 /tmp/superbench.log 供跑完查阅，不污染当前目录）
 init_log_file() {
-    LOG_FILE="$WORK_DIR/superbench.log"
+    if [[ -w "/tmp" ]]; then
+        LOG_FILE="/tmp/superbench.log"
+    else
+        LOG_FILE="$IO_DIR/superbench.log"
+    fi
     SPEED_LOG="$WORK_DIR/speedtest.log"
     : > "$LOG_FILE"
     : > "$SPEED_LOG"
@@ -126,6 +129,7 @@ cleanup() {
         }
     fi
 }
+
 cancel() {
     echo ""
     next
@@ -206,7 +210,7 @@ about() {
 }
 
 next() {
-    if [[ -n "$LOG_FILE" ]]; then
+    if [[ -n "${LOG_FILE:-}" && -w "${LOG_FILE:-}" ]]; then
         printf "%-70s\n" "-" | sed 's/\s/-/g' | tee -a "$LOG_FILE"
     else
         printf "%-70s\n" "-" | sed 's/\s/-/g'
@@ -228,7 +232,6 @@ get_opsy() {
 virt_check() {
     virtual="Dedicated"
 
-    # 1. 优先使用现代 systemd-detect-virt
     if command -v systemd-detect-virt >/dev/null 2>&1; then
         local sdv
         sdv=$(systemd-detect-virt 2>/dev/null)
@@ -238,7 +241,6 @@ virt_check() {
         fi
     fi
 
-    # 2. 容器环境特征文件检测（兼容 cgroup v1/v2）
     if [[ -f /.dockerenv ]]; then
         virtual="Docker"; return
     elif [[ -f /run/.containerenv ]]; then
@@ -251,7 +253,6 @@ virt_check() {
         virtual="OpenVZ"; return
     fi
 
-    # 3. 免 Root 读取 /sys/class/dmi/id 识别硬件虚拟化
     local sys_vendor="" product_name=""
     [[ -r /sys/class/dmi/id/sys_vendor ]] && sys_vendor=$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null)
     [[ -r /sys/class/dmi/id/product_name ]] && product_name=$(cat /sys/class/dmi/id/product_name 2>/dev/null)
@@ -274,7 +275,6 @@ virt_check() {
     fi
 }
 
-# 使用 POSIX 标准 1K 块精确汇总磁盘容量（消除原版单位换算 Bug）
 calc_disk_info() {
     local df_out
     df_out=$(LC_ALL=C df -kP 2>/dev/null | grep -wvE '^Filesystem|none|tmpfs|devtmpfs|overlay|shm|udev|squashfs|efivarfs|iso9660' | awk '!seen[$1]++')
@@ -283,7 +283,6 @@ calc_disk_info() {
 }
 
 get_system_info() {
-    # 1. 兼容 x86_64 与 ARM64 的 CPU 型号识别
     cname=""
     if command -v lscpu >/dev/null 2>&1; then
         cname=$(LC_ALL=C lscpu 2>/dev/null | awk -F: '/^Model name:/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}')
@@ -293,13 +292,11 @@ get_system_info() {
     fi
     [[ -z "$cname" ]] && cname="Unknown CPU"
 
-    # 2. CPU 核心数识别
     cores=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null)
     if [[ -z "$cores" || "$cores" -eq 0 ]]; then
         cores=$(nproc 2>/dev/null || echo 1)
     fi
 
-    # 3. 兼容 ARM 与动态调频的 CPU 频率获取
     freq=$(awk -F: '/cpu MHz/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); printf "%.0f", $2; exit}' /proc/cpuinfo 2>/dev/null)
     if [[ -z "$freq" && -r /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq ]]; then
         freq=$(awk '{printf "%.0f", $1 / 1000}' /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq 2>/dev/null)
@@ -309,14 +306,12 @@ get_system_info() {
     fi
     [[ -z "$freq" ]] && freq="N/A"
 
-    # 4. CPU 缓存大小识别
     corescache=$(awk -F: '/cache size/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}' /proc/cpuinfo 2>/dev/null)
     if [[ -z "$corescache" ]] && command -v lscpu >/dev/null 2>&1; then
         corescache=$(LC_ALL=C lscpu 2>/dev/null | awk -F: '/L3 cache|L2 cache/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}')
     fi
     [[ -z "$corescache" ]] && corescache="N/A"
 
-    # 5. 内存与 Swap 统计（直接读取 /proc/meminfo 兼容所有发行版）
     tram=$(awk '/^MemTotal:/ {printf "%.0f", $2 / 1024}' /proc/meminfo 2>/dev/null)
     tram=${tram:-0}
     local mavail mfree mbuff mcached
@@ -339,7 +334,6 @@ get_system_info() {
     uswap=$(( swap - ${sfree:-0} ))
     [[ $uswap -lt 0 ]] && uswap=0
 
-    # 6. 运行时间、负载与系统架构信息
     up=$(awk '{a=$1/86400; b=($1%86400)/3600; c=($1%3600)/60} {printf("%d days %d hour %d min\n",a,b,c)}' /proc/uptime 2>/dev/null)
     load=$(awk '{print $1", "$2", "$3}' /proc/loadavg 2>/dev/null)
     opsy=$(get_opsy)
@@ -347,7 +341,6 @@ get_system_info() {
     lbit=$(getconf LONG_BIT 2>/dev/null || echo "64")
     kern=$(uname -r)
 
-    # 7. 磁盘容量、TCP 拥塞控制与虚拟化检测
     calc_disk_info
 
     tcpctrl="N/A"
@@ -374,7 +367,6 @@ print_system_info() {
 
 # ======================== 纯 Bash 双栈网络与归属地检测 ========================
 
-# 纯 Bash 提取 JSON 字符串键值（无需 Python 或 jq）
 json_extract() {
     local json=$1
     local key=$2
@@ -404,7 +396,6 @@ ip_info() {
         echo -e " IPv4 Status          : ${RED}Offline or API Blocked${PLAIN}" | tee -a "$LOG_FILE"
     fi
 
-    # 新增 IPv6 连通性检测
     local ipv6_check=""
     if command -v curl >/dev/null 2>&1; then
         ipv6_check=$(curl -6 -fsSL --max-time 4 "https://api64.ipify.org" 2>/dev/null)
@@ -419,7 +410,6 @@ ip_info() {
 # ======================== 安全磁盘 I/O 测试 ========================
 
 freedisk() {
-    # 检测选定的真实磁盘目录 IO_DIR 剩余空间（MB）
     local freespace
     freespace=$(df -mP "$IO_DIR" 2>/dev/null | awk 'NR==2 {print $4}')
     if [[ -z "$freespace" || ! "$freespace" =~ ^[0-9]+$ ]]; then
@@ -449,7 +439,6 @@ io_test() {
     rm -f "$test_file" 2>/dev/null
 }
 
-# 将 dd 输出统一转换为 MB/s 浮点数
 parse_io_mb() {
     local io_str=$1
     local val unit
@@ -505,6 +494,8 @@ print_io() {
 }
 
 # ======================== 现代化网络测速模块 ========================
+# 策略：海外/国际采用 Fast.com (Netflix) + Cloudflare CDN + 本地最优节点
+#       国内采用 西安 / 北京 / 上海 / 广东 四大区域动态搜索 + 多节点容灾池
 
 install_speedtest() {
     local st_bin="$WORK_DIR/speedtest"
@@ -517,7 +508,7 @@ install_speedtest() {
         armv7l|armhf)   arch_tag="armhf" ;;
         i386|i686)      arch_tag="i386" ;;
         *)
-            echo -e "${YELLOW}[提示] 当前架构 $(uname -m) 无官方 Speedtest 二进制包，将使用 HTTP 测速兜底。${PLAIN}"
+            echo -e "${YELLOW}[提示] 当前架构 $(uname -m) 无官方 Speedtest 二进制包，将使用 HTTP 测速。${PLAIN}"
             return 1
             ;;
     esac
@@ -533,11 +524,53 @@ install_speedtest() {
     fi
     return 1
 }
-# 纯 Curl 测速（支持真实延迟、上传、下载测速，告别 N/A 和 -）
-speed_cloudflare_fallback() {
-    command -v curl >/dev/null 2>&1 || return
 
-    # 1. 测量连接延迟 (ms)
+# 纯 Bash 实现 Fast.com (Netflix OCA CDN) 多线程并发测速（无需 Python）
+speed_fast_com() {
+    command -v curl >/dev/null 2>&1 || return 1
+
+    local ua="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    local js_name token=""
+
+    # 1. 动态获取 Fast.com JS Token，失败则回退到官方固定 Public Token
+    js_name=$(curl -4 -fsSL -A "$ua" --max-time 5 "https://fast.com" 2>/dev/null | grep -oE 'app-[a-f0-9]+\.js' | head -n1)
+    if [[ -n "$js_name" ]]; then
+        token=$(curl -4 -fsSL -A "$ua" --max-time 5 "https://fast.com/${js_name}" 2>/dev/null | grep -oE 'token:"[^"]+"' | head -n1 | cut -d'"' -f2)
+    fi
+    [[ -z "$token" ]] && token="YXNkZmFzZGxmbnNkYWZoYXNkZmhrYWxm"
+
+    # 2. 请求 Netflix Speedtest v2 接口获取分配的 OCA 测速节点 URL
+    local api_json urls first_url
+    api_json=$(curl -4 -fsSL -A "$ua" --max-time 6 "https://api.fast.com/netflix/speedtest/v2?https=true&token=${token}&urlCount=3" 2>/dev/null)
+    urls=$(echo "$api_json" | grep -oE 'https://[^"]+' | head -n 3)
+    first_url=$(echo "$urls" | head -n 1)
+    [[ -z "$first_url" ]] && return 1
+
+    # 3. 测量到 Netflix CDN 节点的真实连接延迟
+    local lat_sec lat_ms="N/A"
+    lat_sec=$(curl -4 -o /dev/null -s -w "%{time_connect}" --connect-timeout 5 "$first_url" 2>/dev/null)
+    if [[ -n "$lat_sec" ]]; then
+        lat_ms=$(awk -v s="$lat_sec" 'BEGIN {if (s>0) printf "%.2f ms", s * 1000; else print "N/A"}')
+    fi
+
+    # 4. 3 线程并发拉取 Netflix OCA 流并汇总下载速率
+    local total_bps dl_mbps="0.00"
+    total_bps=$(echo "$urls" | xargs -P 3 -I {} curl -4 -sSL -A "$ua" -w "%{speed_download}\n" --connect-timeout 5 --max-time 8 -o /dev/null "{}" 2>/dev/null | awk '{sum += $1} END {print sum}')
+    if [[ -n "$total_bps" ]]; then
+        dl_mbps=$(awk -v bps="$total_bps" 'BEGIN {printf "%.2f", (bps * 8) / 1000000}')
+    fi
+
+    if [[ $(awk -v m="$dl_mbps" 'BEGIN {print (m > 0) ? 1 : 0}') -eq 1 ]]; then
+        printf "${YELLOW}%-22s${GREEN}%-16s${RED}%-18s${SKYBLUE}%-12s${PLAIN}\n" " Fast.com (Netflix)" "N/A (DL Only)" "${dl_mbps} Mbit/s" "${lat_ms}" | tee -a "$LOG_FILE"
+        return 0
+    fi
+    return 1
+}
+
+# 纯 Curl 测量 Cloudflare CDN（真实延迟、上传、下载）
+speed_cloudflare_cdn() {
+    command -v curl >/dev/null 2>&1 || return 1
+
     local lat_sec lat_ms
     lat_sec=$(curl -4 -o /dev/null -s -w "%{time_connect}" --connect-timeout 5 "https://speed.cloudflare.com/__down?bytes=0" 2>/dev/null)
     if [[ -n "$lat_sec" ]]; then
@@ -546,14 +579,12 @@ speed_cloudflare_fallback() {
         lat_ms="N/A"
     fi
 
-    # 2. 测量下载速度 (取 25MB 防止超时截断)
     local dl_bps dl_mbps="0.00"
     dl_bps=$(curl -4 -sSL -w "%{speed_download}" --connect-timeout 5 --max-time 10 -o /dev/null "https://speed.cloudflare.com/__down?bytes=25000000" 2>/dev/null)
     if [[ -n "$dl_bps" ]]; then
         dl_mbps=$(awk -v bps="$dl_bps" 'BEGIN {printf "%.2f", (bps * 8) / 1000000}')
     fi
 
-    # 3. 测量上传速度 (上传 10MB 数据流)
     local up_bps up_mbps="0.00"
     up_bps=$(dd if=/dev/zero bs=1M count=10 2>/dev/null | curl -4 -sSL -w "%{speed_upload}" --connect-timeout 5 --max-time 10 -o /dev/null --data-binary @- "https://speed.cloudflare.com/__up" 2>/dev/null)
     if [[ -n "$up_bps" ]]; then
@@ -562,18 +593,20 @@ speed_cloudflare_fallback() {
 
     if [[ $(awk -v m="$dl_mbps" 'BEGIN {print (m > 0) ? 1 : 0}') -eq 1 ]]; then
         printf "${YELLOW}%-22s${GREEN}%-16s${RED}%-18s${SKYBLUE}%-12s${PLAIN}\n" " Cloudflare CDN" "${up_mbps} Mbit/s" "${dl_mbps} Mbit/s" "${lat_ms}" | tee -a "$LOG_FILE"
+        return 0
     fi
+    return 1
 }
 
+# 单节点 Ookla Speedtest 测速执行器
 speed_test() {
     local node_id=$1
     local node_name=$2
     local st_bin="$WORK_DIR/speedtest"
     [[ ! -x "$st_bin" ]] && return 1
 
-    # 增加 timeout 45 秒保护，防止失效节点无限卡死
     local cmd_prefix=()
-    command -v timeout >/dev/null 2>&1 && cmd_prefix=(timeout 45)
+    command -v timeout >/dev/null 2>&1 && cmd_prefix=(timeout 40)
 
     if [[ -z "$node_id" ]]; then
         HOME="$WORK_DIR" "${cmd_prefix[@]}" "$st_bin" -p no --accept-license --accept-gdpr > "$SPEED_LOG" 2>&1
@@ -594,53 +627,137 @@ speed_test() {
     fi
 
     if [[ -n "$dl" ]]; then
-        # 放宽 Node Name 列宽到 22 字符，不再腰斩节点名
         printf "${YELLOW}%-22s${GREEN}%-16s${RED}%-18s${SKYBLUE}%-12s${PLAIN}\n" " ${node_name:0:20}" "${up:-0.00} Mbit/s" "${dl} Mbit/s" "${lat:-N/A} ms" | tee -a "$LOG_FILE"
         return 0
     fi
     return 1
 }
 
-run_dynamic_speedtest() {
-    local max_nearby=${1:-4}
-    local st_bin="$WORK_DIR/speedtest"
-    [[ ! -x "$st_bin" ]] && return 1
+# 根据 Sponsor / Host 自动识别中国三大运营商标识 (CT/CU/CM)
+detect_cn_isp_tag() {
+    local raw_info=$1
+    local info_lc
+    info_lc=$(echo "$raw_info" | tr '[:upper:]' '[:lower:]')
 
-    local success_count=0
-
-    # 1. 默认自动测速最优节点 (Auto Best)
-    speed_test '' 'Speedtest Default' && ((success_count++))
-
-    # 2. 动态拉取机器附近的节点（跳过第 1 个避免与 Default 重复，去掉多余的 Nearby: 前缀防截断）
-    local server_list
-    server_list=$(HOME="$WORK_DIR" "$st_bin" -L --accept-license --accept-gdpr 2>/dev/null | awk '/^[[:space:]]*[0-9]+[[:space:]]+/ {
-        id=$1;
-        $1="";
-        gsub(/^[[:space:]]+/, "", $0);
-        printf "%s|%s\n", id, substr($0, 1, 20)
-    }' | tail -n +2 | head -n "$max_nearby")
-
-    local sid sname
-    while IFS='|' read -r sid sname; do
-        [[ -z "$sid" ]] && continue
-        speed_test "$sid" "$sname" && ((success_count++))
-    done <<< "$server_list"
-
-    [[ $success_count -gt 0 ]] && return 0 || return 1
-}
-
-print_speedtest() {
-    printf "%-22s%-16s%-18s%-12s\n" " Node Name" "Upload Speed" "Download Speed" "Latency" | tee -a "$LOG_FILE"
-    if install_speedtest && run_dynamic_speedtest 3; then
-        speed_cloudflare_fallback
+    if [[ "$info_lc" == *"telecom"* || "$info_lc" == *"chinanet"* || "$info_lc" == *"163"* || "$info_lc" == *"189"* || "$raw_info" == *"电信"* ]]; then
+        echo "CT"
+    elif [[ "$info_lc" == *"unicom"* || "$info_lc" == *"10010"* || "$raw_info" == *"联通"* ]]; then
+        echo "CU"
+    elif [[ "$info_lc" == *"mobile"* || "$info_lc" == *"cmcc"* || "$info_lc" == *"10086"* || "$raw_info" == *"移动"* ]]; then
+        echo "CM"
     else
-        run_librespeed_fallback
-        speed_cloudflare_fallback
+        echo "5G"
     fi
 }
 
+# 动态从 Ookla 官方搜索 API 获取指定中国城市的实时可用节点，并合并内置容灾节点池
+# 参数: $1=展示城市名, $2=搜索关键词列表(逗号分隔), $3=内置兜底列表(ID:ISP格式,空格分隔), $4=期望成功测速节点数
+test_cn_region() {
+    local region_label=$1
+    local search_keys=$2
+    local fallback_list=$3
+    local max_success=${4:-2}
 
-# 当 Ookla 被机房墙/403 拦截时，使用开源 LibreSpeed CLI 进行多节点测速
+    local candidates=()
+    local seen_ids=" "
+    local ua="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+
+    # 1. 实时查询 Speedtest 官方 API 获取当前在线的该地区节点
+    if command -v curl >/dev/null 2>&1; then
+        local kw api_res line sid sponsor host isp_tag
+        IFS=',' read -ra kw_arr <<< "$search_keys"
+        for kw in "${kw_arr[@]}"; do
+            api_res=$(curl -4 -fsSL -A "$ua" --max-time 5 "https://www.speedtest.net/api/js/servers?engine=js&https_functional=true&limit=15&search=${kw}" 2>/dev/null)
+            [[ -z "$api_res" ]] && continue
+
+            while IFS= read -r line; do
+                [[ -z "$line" ]] && continue
+                sid=$(echo "$line" | grep -oE '"id"[[:space:]]*:[[:space:]]*"?[0-9]+"?' | head -n1 | grep -oE '[0-9]+')
+                [[ -z "$sid" || "$seen_ids" == *" $sid "* ]] && continue
+
+                sponsor=$(echo "$line" | grep -oE '"sponsor"[[:space:]]*:[[:space:]]*"[^"]*"' | head -n1 | sed -E 's/"sponsor"[[:space:]]*:[[:space:]]*"([^"]*)"/\1/')
+                host=$(echo "$line" | grep -oE '"host"[[:space:]]*:[[:space:]]*"[^"]*"' | head -n1 | sed -E 's/"host"[[:space:]]*:[[:space:]]*"([^"]*)"/\1/')
+                isp_tag=$(detect_cn_isp_tag "$sponsor $host")
+
+                seen_ids+="$sid "
+                candidates+=("${sid}:${isp_tag}")
+            done < <(echo "$api_res" | sed 's/},{/}\n{/g' | grep '"cc":"CN"')
+        done
+    fi
+
+    # 2. 追加内置的多运营商静态备用节点池（防止 API 限流或搜索为空）
+    local item fb_id fb_isp
+    for item in $fallback_list; do
+        fb_id="${item%%:*}"
+        fb_isp="${item#*:}"
+        if [[ -n "$fb_id" && "$seen_ids" != *" $fb_id "* ]]; then
+            seen_ids+="$fb_id "
+            candidates+=("${fb_id}:${fb_isp}")
+        fi
+    done
+
+    # 3. 优先挑选不同运营商 (CT/CU/CM) 进行测速，失败则自动顺延尝试下一个候选节点
+    local success_count=0
+    local tested_isps=" "
+    local tested_ids=" "
+    local entry cid cisp display_name
+
+    # 第一轮：优先覆盖不同运营商
+    for entry in "${candidates[@]}"; do
+        [[ $success_count -ge $max_success ]] && break
+        cid="${entry%%:*}"
+        cisp="${entry#*:}"
+        [[ "$tested_isps" == *" $cisp "* ]] && continue
+
+        display_name=$(printf "%-12s %s" "$region_label" "$cisp")
+        tested_ids+="$cid "
+        if speed_test "$cid" "$display_name"; then
+            tested_isps+="$cisp "
+            ((++success_count))
+        fi
+    done
+
+    # 第二轮：若未达到目标数量，继续从剩余节点补齐
+    for entry in "${candidates[@]}"; do
+        [[ $success_count -ge $max_success ]] && break
+        cid="${entry%%:*}"
+        cisp="${entry#*:}"
+        [[ "$tested_ids" == *" $cid "* ]] && continue
+
+        display_name=$(printf "%-12s %s" "$region_label" "$cisp")
+        tested_ids+="$cid "
+        if speed_test "$cid" "$display_name"; then
+            ((++success_count))
+        fi
+    done
+
+    return $(( success_count > 0 ? 0 : 1 ))
+}
+
+# 运行中国四大重点区域（西安、北京、上海、广东）测速
+run_china_speedtest() {
+    local nodes_per_region=${1:-2}
+    local st_bin="$WORK_DIR/speedtest"
+    [[ ! -x "$st_bin" ]] && return 1
+
+    local total_cn_success=0
+
+    # 1. 西安节点 (西北枢纽: 陕西移动 / 西安联通 / 陕西电信)
+    test_cn_region "CN Xi'an"     "Xian,Shaanxi"            "29105:CM 4863:CU 5292:CM 3633:CT"          "$nodes_per_region" && ((++total_cn_success))
+
+    # 2. 北京节点 (华北枢纽: 北京联通 / 北京移动 / 北京电信)
+    test_cn_region "CN Beijing"   "Beijing"                 "43752:CU 25858:CM 5145:CU 4751:CT 4713:CM" "$nodes_per_region" && ((++total_cn_success))
+
+    # 3. 上海节点 (华东枢纽: 上海联通5G / 上海电信 / 上海移动)
+    test_cn_region "CN Shanghai"  "Shanghai"                "24447:CU 5083:CU 3633:CT 25637:CM"         "$nodes_per_region" && ((++total_cn_success))
+
+    # 4. 广东节点 (华南枢纽: 广州/深圳 电信 / 移动 / 联通)
+    test_cn_region "CN Guangdong" "Guangzhou,Shenzhen"      "60584:CT 60794:CM 27594:CT 26678:CU 17251:CT" "$nodes_per_region" && ((++total_cn_success))
+
+    [[ $total_cn_success -gt 0 ]] && return 0 || return 1
+}
+
+# 当 Ookla 完全不可用时，使用开源 LibreSpeed CLI 兜底
 run_librespeed_fallback() {
     local ls_bin="$WORK_DIR/librespeed-cli"
     local ls_ver="1.0.11"
@@ -666,38 +783,71 @@ run_librespeed_fallback() {
 
     [[ ! -x "$ls_bin" ]] && return 1
 
-    # 自动测速最近的 3 个 LibreSpeed 节点，输出 CSV 格式便于 awk 解析
+    local cmd_prefix=()
+    command -v timeout >/dev/null 2>&1 && cmd_prefix=(timeout 60)
+
     local out
-    out=$(timeout 60 "$ls_bin" --csv --concurrent 3 2>/dev/null)
+    out=$("${cmd_prefix[@]}" "$ls_bin" --csv --concurrent 3 2>/dev/null)
     [[ -z "$out" ]] && return 1
 
     local count=0
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
-        local sname lat dl up
-        # CSV 字段参考: id,name,location,ping,jitter,download,upload,...
-        sname=$(echo "$line" | awk -F',' '{gsub(/"/, "", $2); print substr($2, 1, 20)}')
-        lat=$(echo "$line"   | awk -F',' '{print $5}')
-        dl=$(echo "$line"    | awk -F',' '{print $7}')
-        up=$(echo "$line"    | awk -F',' '{print $8}')
+        # 先将双引号内的逗号替换为空格，防止城市名带逗号导致 awk 列错位
+        local clean_line sname lat dl up
+        clean_line=$(echo "$line" | awk -F'"' -v OFS='' '{for (i=2; i<=NF; i+=2) gsub(/,/, " ", $i)} 1')
+        sname=$(echo "$clean_line" | awk -F',' '{print substr($2, 1, 20)}')
+        lat=$(echo "$clean_line"   | awk -F',' '{print $5}')
+        dl=$(echo "$clean_line"    | awk -F',' '{print $7}')
+        up=$(echo "$clean_line"    | awk -F',' '{print $8}')
         if [[ -n "$dl" && "$dl" =~ ^[0-9.]+$ ]]; then
             printf "${YELLOW}%-22s${GREEN}%-16s${RED}%-18s${SKYBLUE}%-12s${PLAIN}\n" " ${sname:-LibreSpeed}" "${up:-0.00} Mbit/s" "${dl} Mbit/s" "${lat:-N/A} ms" | tee -a "$LOG_FILE"
-            ((count++))
+            ((++count))
         fi
     done <<< "$out"
 
     [[ $count -gt 0 ]] && return 0 || return 1
 }
 
-print_speedtest_fast() {
+print_speedtest() {
     printf "%-22s%-16s%-18s%-12s\n" " Node Name" "Upload Speed" "Download Speed" "Latency" | tee -a "$LOG_FILE"
-    if install_speedtest; then
-        run_dynamic_speedtest 1 || speed_cloudflare_fallback
+
+    local has_ookla=0
+    install_speedtest && has_ookla=1
+
+    # 1. 海外与国际主流 CDN 测速 (本地最优 + Fast.com + Cloudflare CDN)
+    if [[ $has_ookla -eq 1 ]]; then
+        speed_test '' 'Speedtest Default' || true
+    fi
+    speed_fast_com || true
+    speed_cloudflare_cdn || true
+
+    # 2. 中国四大核心区域测速 (西安 / 北京 / 上海 / 广东，标准模式每区测 2 个节点)
+    if [[ $has_ookla -eq 1 ]]; then
+        run_china_speedtest 2 || run_librespeed_fallback || true
     else
-        speed_cloudflare_fallback
+        run_librespeed_fallback || true
     fi
 }
 
+print_speedtest_fast() {
+    printf "%-22s%-16s%-18s%-12s\n" " Node Name" "Upload Speed" "Download Speed" "Latency" | tee -a "$LOG_FILE"
+
+    local has_ookla=0
+    install_speedtest && has_ookla=1
+
+    # 1. 海外与国际主流 CDN 测速
+    if [[ $has_ookla -eq 1 ]]; then
+        speed_test '' 'Speedtest Default' || true
+    fi
+    speed_fast_com || true
+    speed_cloudflare_cdn || true
+
+    # 2. 中国四大核心区域快速测速 (西安 / 北京 / 上海 / 广东，快速模式每区测 1 个节点)
+    if [[ $has_ookla -eq 1 ]]; then
+        run_china_speedtest 1 || true
+    fi
+}
 
 # ======================== 时间统计与结果分享 ========================
 
@@ -721,12 +871,12 @@ print_end_time() {
 
     bj_time=$(TZ='Asia/Shanghai' date "+%Y-%m-%d %H:%M:%S" 2>/dev/null || date -u "+%Y-%m-%d %H:%M:%S UTC")
     echo " Timestamp    : $bj_time (GMT+8)" | tee -a "$LOG_FILE"
+    echo " Results Log  : $LOG_FILE"
 }
 
 sharetest() {
     command -v curl >/dev/null 2>&1 || return
     local clean_log="$WORK_DIR/superbench_clean.log"
-    # 剥离 ANSI 颜色字符，保证在线预览排版整洁
     sed -r "s/\x1B\[([0-9]{1,2}(;[0-9]{1,2})?)?[m|K]//g" "$LOG_FILE" > "$clean_log" 2>/dev/null
 
     local share_link=""
@@ -736,7 +886,6 @@ sharetest() {
             ;;
         *)
             share_link=$(curl -fsSL --max-time 10 --data-binary @"$clean_log" https://paste.rs 2>/dev/null | tr -d '\r\n ')
-            # 若 paste.rs 网络超时，自动切换 clbin.com 兜底
             if [[ -z "$share_link" ]]; then
                 share_link=$(curl -fsSL --max-time 10 -F 'clbin=<-' https://clbin.com < "$clean_log" 2>/dev/null | tr -d '\r\n ')
             fi
