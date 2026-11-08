@@ -536,6 +536,8 @@ speed_cloudflare_fallback() {
         fi
     fi
 }
+
+
 speed_test() {
     local node_id=$1
     local node_name=$2
@@ -548,36 +550,62 @@ speed_test() {
         "$st_bin" -p no -s "$node_id" --accept-license --accept-gdpr > "$SPEED_LOG" 2>&1
     fi
 
-    if grep -q "Upload:" "$SPEED_LOG" 2>/dev/null; then
-        local dl up lat current_url
-        dl=$(awk '/Download:/ {print $2}' "$SPEED_LOG")
-        up=$(awk '/Upload:/ {print $2}' "$SPEED_LOG")
-        lat=$(awk '/Idle Latency:|Latency:/ {print $2; exit}' "$SPEED_LOG")
-        current_url=$(awk '/Result URL:/ {print $3}' "$SPEED_LOG")
+    # 使用正则直接提取冒号后的浮点数，彻底规避 \r 回车符与字段列数偏移
+    local dl up lat current_url
+    dl=$(grep -oE 'Download:[[:space:]]*[0-9.]+' "$SPEED_LOG" 2>/dev/null | tail -n1 | awk -F: '{gsub(/ /, "", $2); print $2}')
+    up=$(grep -oE 'Upload:[[:space:]]*[0-9.]+' "$SPEED_LOG" 2>/dev/null | tail -n1 | awk -F: '{gsub(/ /, "", $2); print $2}')
+    lat=$(grep -oE 'Latency:[[:space:]]*[0-9.]+' "$SPEED_LOG" 2>/dev/null | tail -n1 | awk -F: '{gsub(/ /, "", $2); print $2}')
+    current_url=$(grep -oE 'https://www\.speedtest\.net/result/[a-zA-Z0-9/-]+' "$SPEED_LOG" 2>/dev/null | tail -n1)
 
-        # 优先锁定默认主节点的 Speedtest 官方结果链接；若主节点未生成则用后续成功节点兜底
-        if [[ -n "$current_url" ]]; then
-            if [[ -z "$node_id" || -z "${RESULT_SPEED:-}" ]]; then
-                RESULT_SPEED="$current_url"
-            fi
-        fi
-
-        if [[ -n "$dl" ]]; then
-            printf "${YELLOW}%-18s${GREEN}%-18s${RED}%-20s${SKYBLUE}%-12s${PLAIN}\n" " ${node_name}" "${up} Mbit/s" "${dl} Mbit/s" "${lat:-N/A} ms" | tee -a "$LOG_FILE"
+    if [[ -n "$current_url" ]]; then
+        if [[ -z "$node_id" || -z "${RESULT_SPEED:-}" ]]; then
+            RESULT_SPEED="$current_url"
         fi
     fi
+
+    if [[ -n "$dl" ]]; then
+        printf "${YELLOW}%-18s${GREEN}%-18s${RED}%-20s${SKYBLUE}%-12s${PLAIN}\n" " ${node_name:0:16}" "${up:-0.00} Mbit/s" "${dl} Mbit/s" "${lat:-N/A} ms" | tee -a "$LOG_FILE"
+    fi
+}
+
+
+# 自动从 Speedtest 官方列表获取当前服务器附近可用的节点进行测试
+run_dynamic_speedtest() {
+    local max_nodes=${1:-5}
+    local st_bin="$WORK_DIR/speedtest"
+    [[ ! -x "$st_bin" ]] && return
+
+    # 1. 先跑默认最优节点
+    speed_test '' 'Speedtest Auto'
+
+    # 2. 尝试常用国内外及亚太重点节点（存活则输出，失效自动跳过）
+    speed_test '5396'  'Suzhou 5G    CT'
+    speed_test '24447' 'Shanghai 5G  CU'
+    speed_test '25858' 'Beijing      CM'
+    speed_test '32291' 'HongKong     CN'
+    speed_test '13623' 'Singapore    SG'
+    speed_test '48463' 'Tokyo        JP'
+
+    # 3. 动态拉取当前 VPS 附近真实在线的节点补充测试（防止固定节点全部失效）
+    local server_list
+    server_list=$("$st_bin" -L --accept-license --accept-gdpr 2>/dev/null | awk '/^[[:space:]]*[0-9]+[[:space:]]+/ {
+        id=$1;
+        $1="";
+        gsub(/^[[:space:]]+/, "", $0);
+        printf "%s|%s\n", id, substr($0, 1, 15)
+    }' | head -n "$max_nodes")
+
+    local line sid sname
+    while IFS='|' read -r sid sname; do
+        [[ -z "$sid" ]] && continue
+        speed_test "$sid" "$sname"
+    done <<< "$server_list"
 }
 
 print_speedtest() {
     printf "%-18s%-18s%-20s%-12s\n" " Node Name" "Upload Speed" "Download Speed" "Latency" | tee -a "$LOG_FILE"
     if install_speedtest; then
-        speed_test '' 'Speedtest Auto'
-        speed_test '3633'  'Shanghai     CT'
-        speed_test '27594' 'Guangzhou 5G CT'
-        speed_test '24447' 'Shanghai 5G  CU'
-        speed_test '26678' 'Guangzhou 5G CU'
-        speed_test '25637' 'Shanghai 5G  CM'
-        speed_test '26850' 'Wuxi 5G      CM'
+        run_dynamic_speedtest 4
     fi
     speed_cloudflare_fallback
 }
@@ -585,12 +613,11 @@ print_speedtest() {
 print_speedtest_fast() {
     printf "%-18s%-18s%-20s%-12s\n" " Node Name" "Upload Speed" "Download Speed" "Latency" | tee -a "$LOG_FILE"
     if install_speedtest; then
-        speed_test '' 'Speedtest Auto'
-        speed_test '3633'  'Shanghai     CT'
-        speed_test '24447' 'Shanghai 5G  CU'
+        run_dynamic_speedtest 2
     fi
     speed_cloudflare_fallback
 }
+
 
 # ======================== 时间统计与结果分享 ========================
 
