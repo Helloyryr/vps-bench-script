@@ -3,7 +3,7 @@
 # Description : Modernized Cross-Platform System Info, I/O & Network Benchmark Script
 # Based on    : Superbench.sh by Oldking & Bench.sh by Teddysun
 # License     : MIT License
-# Version     : v2.2.0
+# Version     : v2.3.0
 #
 
 # 开启管道错误传递，未定义变量在关键处手动校验以保证兼容性
@@ -16,7 +16,7 @@ YELLOW='\033[0;33m'
 SKYBLUE='\033[0;36m'
 PLAIN='\033[0m'
 
-VERSION="2.2.0"
+VERSION="2.3.0"
 SPEEDTEST_VER="1.2.0"
 START_TIME=$(date +%s)
 
@@ -489,8 +489,9 @@ print_io() {
 
 # ======================== 现代化网络测速模块 ========================
 # 1. 国际/本地基准：Speedtest Default + Fast.com (Netflix) + Cloudflare CDN
-# 2. 中国四区回程：接入每日更新的 speedtest.cn 节点库 (西安 / 北京 / 上海 / 广东)
-#    采用 6 线程并发毫秒级探活 + 原生 HTTP 多线程上传/下载，彻底解决跨国锁区与节点失效
+# 2. 中国四区回程：西安 / 北京 / 上海 / 广东
+#    采用 speedtest.cn 节点库 (去重+防盗链Header+10线程探活) + 四大区域 443 骨干网保底
+#    所有 curl 延迟均采用 (time_connect - time_namelookup) 剔除跨国 DNS 解析耗时
 
 install_speedtest() {
     local st_bin="$WORK_DIR/speedtest"
@@ -517,6 +518,21 @@ install_speedtest() {
     return 1
 }
 
+# 纯 Curl 精确测量目标 URL 的真实 TCP RTT 延迟 (ms)，彻底剔除 DNS 解析时间
+measure_tcp_latency_ms() {
+    local target_url=$1
+    local timing
+    timing=$(curl -4 -k -o /dev/null -s -w "%{time_namelookup} %{time_connect}" --connect-timeout 4 --max-time 6 "$target_url" 2>/dev/null)
+    [[ -z "$timing" ]] && { echo "N/A"; return; }
+    awk -v t="$timing" 'BEGIN {
+        split(t, a, " ");
+        diff = (a[2] - a[1]) * 1000;
+        if (diff > 0.05) printf "%.2f ms", diff;
+        else if (a[2] > 0) printf "%.2f ms", a[2] * 1000;
+        else print "N/A";
+    }'
+}
+
 # 纯 Bash 实现 Fast.com (Netflix OCA CDN) 3 线程并发测速
 speed_fast_com() {
     command -v curl >/dev/null 2>&1 || return 1
@@ -536,11 +552,8 @@ speed_fast_com() {
     first_url=$(echo "$urls" | head -n 1)
     [[ -z "$first_url" ]] && return 1
 
-    local lat_sec lat_ms="N/A"
-    lat_sec=$(curl -4 -o /dev/null -s -w "%{time_connect}" --connect-timeout 5 "$first_url" 2>/dev/null)
-    if [[ -n "$lat_sec" ]]; then
-        lat_ms=$(awk -v s="$lat_sec" 'BEGIN {if (s>0) printf "%.2f ms", s * 1000; else print "N/A"}')
-    fi
+    local lat_ms
+    lat_ms=$(measure_tcp_latency_ms "$first_url")
 
     local total_bps dl_mbps="0.00"
     total_bps=$(echo "$urls" | xargs -P 3 -I {} curl -4 -sSL -A "$ua" -w "%{speed_download}\n" --connect-timeout 5 --max-time 8 -o /dev/null "{}" 2>/dev/null | awk '{sum += $1} END {print sum}')
@@ -555,17 +568,12 @@ speed_fast_com() {
     return 1
 }
 
-# 纯 Curl 测量 Cloudflare CDN（真实延迟、上传、下载）
+# 纯 Curl 测量 Cloudflare CDN（真实 TCP 延迟、上传、下载）
 speed_cloudflare_cdn() {
     command -v curl >/dev/null 2>&1 || return 1
 
-    local lat_sec lat_ms
-    lat_sec=$(curl -4 -o /dev/null -s -w "%{time_connect}" --connect-timeout 5 "https://speed.cloudflare.com/__down?bytes=0" 2>/dev/null)
-    if [[ -n "$lat_sec" ]]; then
-        lat_ms=$(awk -v s="$lat_sec" 'BEGIN {if (s>0) printf "%.2f ms", s * 1000; else print "N/A"}')
-    else
-        lat_ms="N/A"
-    fi
+    local lat_ms
+    lat_ms=$(measure_tcp_latency_ms "https://speed.cloudflare.com/__down?bytes=0")
 
     local dl_bps dl_mbps="0.00"
     dl_bps=$(curl -4 -sSL -w "%{speed_download}" --connect-timeout 5 --max-time 10 -o /dev/null "https://speed.cloudflare.com/__down?bytes=25000000" 2>/dev/null)
@@ -621,7 +629,7 @@ speed_test_ookla() {
     return 1
 }
 
-# 下载每日自动更新的 speedtest.cn 中国大陆三网节点库 (telecom / unicom / mobile)
+# 下载每日自动更新的 speedtest.cn 节点库，并按真实主机去重
 init_cn_node_db() {
     local db_file="$WORK_DIR/cn_nodes_all.csv"
     [[ -s "$db_file" ]] && return 0
@@ -643,10 +651,12 @@ init_cn_node_db() {
 
         for mirror in "${mirrors[@]}"; do
             if download_file "${mirror}/${fname}" "$tmp_csv" 10 && [[ -s "$tmp_csv" ]]; then
-                # 解析 CSV 行，提取：ISP|省市|pingUrl|downloadUrl|uploadUrl
+                # 提取字段并按基础域名去重（避免同一台服务器的 http/https 双记录霸占前排候选池）
                 awk -F',' -v isp="$isp_tag" '
                 NR > 1 {
-                    prov=$8; city=$9;
+                    host=$6; prov=$8; city=$9;
+                    gsub(/^[ \t\r"]+|[ \t\r"]+$/, "", host);
+                    gsub(/\.prod\.hosts\.ooklaserver\.net/, "", host);
                     gsub(/^[ \t\r"]+|[ \t\r"]+$/, "", prov);
                     gsub(/^[ \t\r"]+|[ \t\r"]+$/, "", city);
                     ping=""; dl=""; ul="";
@@ -656,7 +666,7 @@ init_cn_node_db() {
                         else if ($i ~ /^https?:\/\/.*\/download$/) dl=$i;
                         else if ($i ~ /^https?:\/\/.*\/upload$/) ul=$i;
                     }
-                    if (ping != "" && dl != "" && ul != "") {
+                    if (ping != "" && dl != "" && ul != "" && !seen[isp ":" host]++) {
                         printf "%s|%s|%s|%s|%s|%s\n", isp, prov, city, ping, dl, ul;
                     }
                 }' "$tmp_csv" >> "$db_file"
@@ -666,19 +676,52 @@ init_cn_node_db() {
         done
     done
 
-    # 生成 4MB 标准上传载荷文件（使 curl 携带准确的 Content-Length 头，解决 :8080/upload 0.00 速率问题）
+    # 生成 4MB 标准上传载荷文件（携带准确 Content-Length）
     dd if=/dev/zero of="$WORK_DIR/upload_payload.bin" bs=256K count=16 >/dev/null 2>&1 || true
 
-    # 生成单节点并发探活小脚本（在 WORK_DIR 内安全执行，彻底规避复杂的引号转义）
+    # 生成单节点并发探活小脚本：
+    # 1. 放宽超时至 connect 4s / max 6s，适应跨太平洋未缓存 DNS 与 TLS 握手
+    # 2. 用 (time_connect - time_namelookup) 计算纯 TCP 延迟，排除跨国 DNS 解析时间
+    # 3. 携带 speedtest.cn 的 Referer / Origin 头通过 CORS 检查
     cat << 'EOF' > "$WORK_DIR/probe_cn.sh"
 #!/usr/bin/env bash
 IFS='|' read -r isp prov city ping_u dl_u ul_u <<< "$1"
 [[ -z "$ping_u" ]] && exit 0
-res=$(curl -4 -k -s -o /dev/null -w "%{http_code} %{time_connect}" --connect-timeout 2 --max-time 3 "$ping_u" 2>/dev/null)
-code=${res%% *}
-tconn=${res#* }
+ua="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+res=$(curl -4 -k -s -o /dev/null -A "$ua" \
+    -H "Referer: https://www.speedtest.cn/" \
+    -H "Origin: https://www.speedtest.cn" \
+    -w "%{http_code} %{time_namelookup} %{time_connect}" \
+    --connect-timeout 4 --max-time 6 "$ping_u" 2>/dev/null)
+
+# 若 https 因旧版证书被 OpenSSL 3 拒绝，自动回退尝试同端口 plain http
+code=$(echo "$res" | awk '{print $1}')
+if [[ "$code" != "200" && "$code" != "204" && "$ping_u" == https://* ]]; then
+    http_ping="http://${ping_u#https://}"
+    http_ping="${http_ping/.prod.hosts.ooklaserver.net/}"
+    http_dl="http://${dl_u#https://}"
+    http_dl="${http_dl/.prod.hosts.ooklaserver.net/}"
+    http_ul="http://${ul_u#https://}"
+    http_ul="${http_ul/.prod.hosts.ooklaserver.net/}"
+    res=$(curl -4 -s -o /dev/null -A "$ua" \
+        -H "Referer: https://www.speedtest.cn/" \
+        -H "Origin: https://www.speedtest.cn" \
+        -w "%{http_code} %{time_namelookup} %{time_connect}" \
+        --connect-timeout 4 --max-time 5 "$http_ping" 2>/dev/null)
+    code=$(echo "$res" | awk '{print $1}')
+    if [[ "$code" == "200" || "$code" == "204" ]]; then
+        dl_u="$http_dl"
+        ul_u="$http_ul"
+    fi
+fi
+
 if [[ "$code" == "200" || "$code" == "204" ]]; then
-    printf "%s|%s|%s|%s|%s|%s\n" "$isp" "$prov" "$city" "$tconn" "$dl_u" "$ul_u"
+    lat_ms=$(echo "$res" | awk '{
+        diff = ($3 - $2) * 1000;
+        if (diff > 0.1) printf "%.2f", diff;
+        else printf "%.2f", $3 * 1000;
+    }')
+    printf "%s|%s|%s|%s|%s|%s\n" "$isp" "$prov" "$city" "$lat_ms" "$dl_u" "$ul_u"
 fi
 EOF
     chmod 700 "$WORK_DIR/probe_cn.sh"
@@ -689,33 +732,38 @@ EOF
 # 对单个通过探活的国内 speedtest.cn 节点执行 HTTP 多线程下载与上传测速
 run_cn_http_test() {
     local display_name=$1
-    local tconn=$2
+    local lat_ms=$2
     local dl_u=$3
     local ul_u=$4
 
     local ua="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
     local payload="$WORK_DIR/upload_payload.bin"
 
-    local lat_ms
-    lat_ms=$(awk -v s="$tconn" 'BEGIN {if (s>0) printf "%.2f", s * 1000; else print "N/A"}')
-
-    # 1. 双线程并发下载测速 (请求 25MB 数据流，限时 8 秒)
+    # 1. 双线程并发下载测速 (携带 Referer/Origin 防盗链头，限时 8 秒)
     local dl_stats total_bytes total_bps dl_mbps="0.00"
-    dl_stats=$(printf "%s\n%s\n" "${dl_u}?size=25000000" "${dl_u}?size=25000000" | xargs -P 2 -I {} curl -4 -k -sSL -A "$ua" -w "%{size_download} %{speed_download}\n" --connect-timeout 3 --max-time 8 -o /dev/null "{}" 2>/dev/null)
+    dl_stats=$(printf "%s\n%s\n" "$dl_u" "${dl_u}?size=25000000" | xargs -P 2 -I {} curl -4 -k -sSL -A "$ua" \
+        -H "Referer: https://www.speedtest.cn/" \
+        -H "Origin: https://www.speedtest.cn" \
+        -w "%{size_download} %{speed_download}\n" \
+        --connect-timeout 4 --max-time 8 -o /dev/null "{}" 2>/dev/null)
     total_bytes=$(echo "$dl_stats" | awk '{sum += $1} END {print sum+0}')
     total_bps=$(echo "$dl_stats" | awk '{sum += $2} END {print sum+0}')
 
-    # 校验实际下载字节数 > 64KB，排除假 200 拦截页
     if [[ "$total_bytes" -lt 65536 ]]; then
         return 1
     fi
     dl_mbps=$(awk -v bps="$total_bps" 'BEGIN {printf "%.2f", (bps * 8) / 1000000}')
-    [[ $(awk -v m="$dl_mbps" 'BEGIN {print (m > 0.05) ? 1 : 0}') -eq 0 ]] && return 1
+    [[ $(awk -v m="$dl_mbps" 'BEGIN {print (m > 0.10) ? 1 : 0}') -eq 0 ]] && return 1
 
     # 2. 双线程并发上传测速 (发送带 Content-Length 的 4MB 载荷，限时 7 秒)
     local ul_stats up_bps up_mbps="0.00"
     if [[ -f "$payload" ]]; then
-        ul_stats=$(printf "%s\n%s\n" "$ul_u" "$ul_u" | xargs -P 2 -I {} curl -4 -k -sSL -A "$ua" -w "%{speed_upload}\n" --connect-timeout 3 --max-time 7 -o /dev/null -H "Content-Type: application/octet-stream" --data-binary @"$payload" "{}" 2>/dev/null)
+        ul_stats=$(printf "%s\n%s\n" "$ul_u" "$ul_u" | xargs -P 2 -I {} curl -4 -k -sSL -A "$ua" \
+            -H "Referer: https://www.speedtest.cn/" \
+            -H "Origin: https://www.speedtest.cn" \
+            -H "Content-Type: application/octet-stream" \
+            -w "%{speed_upload}\n" \
+            --connect-timeout 4 --max-time 7 -o /dev/null --data-binary @"$payload" "{}" 2>/dev/null)
         up_bps=$(echo "$ul_stats" | awk '{sum += $1} END {print sum+0}')
         up_mbps=$(awk -v bps="$up_bps" 'BEGIN {printf "%.2f", (bps * 8) / 1000000}')
     fi
@@ -724,65 +772,102 @@ run_cn_http_test() {
     return 0
 }
 
-# 按大区测试中国节点：先匹配核心城市，若该市节点对海外 IP 封锁则自动扩充同大区邻近省份
-# 参数: $1=区域展示标签, $2=首选城市正则, $3=同大区替补省市正则, $4=期望测速成功数
+# 四大核心城市 (西安/北京/上海/广东) 443 端口骨干网节点保底测速
+# 当某内陆地区的 :8080 端口被省级防火墙对境外 IP 封锁时，确保 100% 测出该城市真实回国速度与延迟
+run_cn_backbone_fallback() {
+    local region_label=$1
+    local dl_url=$2
+    local ul_url=$3
+
+    local ua="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    local payload="$WORK_DIR/upload_payload.bin"
+
+    local lat_ms
+    lat_ms=$(measure_tcp_latency_ms "$dl_url")
+    [[ "$lat_ms" == "N/A" ]] && return 1
+
+    # 双线程并发拉取该城市骨干机房大文件流
+    local dl_stats total_bytes total_bps dl_mbps="0.00"
+    dl_stats=$(printf "%s\n%s\n" "$dl_url" "$dl_url" | xargs -P 2 -I {} curl -4 -k -sSL -A "$ua" \
+        -w "%{size_download} %{speed_download}\n" \
+        --connect-timeout 4 --max-time 8 -o /dev/null "{}" 2>/dev/null)
+    total_bytes=$(echo "$dl_stats" | awk '{sum += $1} END {print sum+0}')
+    total_bps=$(echo "$dl_stats" | awk '{sum += $2} END {print sum+0}')
+
+    [[ "$total_bytes" -lt 65536 ]] && return 1
+    dl_mbps=$(awk -v bps="$total_bps" 'BEGIN {printf "%.2f", (bps * 8) / 1000000}')
+    [[ $(awk -v m="$dl_mbps" 'BEGIN {print (m > 0.10) ? 1 : 0}') -eq 0 ]] && return 1
+
+    # 测量向该城市骨干节点发送上行数据流的速率
+    local up_bps up_mbps="N/A (DL Only)"
+    if [[ -n "$ul_url" && -f "$payload" ]]; then
+        up_bps=$(curl -4 -k -sSL -A "$ua" -w "%{speed_upload}" --connect-timeout 4 --max-time 6 -o /dev/null --data-binary @"$payload" "$ul_url" 2>/dev/null)
+        if [[ -n "$up_bps" && $(awk -v b="$up_bps" 'BEGIN {print (b > 1000) ? 1 : 0}') -eq 1 ]]; then
+            up_mbps=$(awk -v bps="$up_bps" 'BEGIN {printf "%.2f Mbit/s", (bps * 8) / 1000000}')
+        fi
+    fi
+
+    printf "${YELLOW}%-22s${GREEN}%-16s${RED}%-18s${SKYBLUE}%-12s${PLAIN}\n" " ${region_label:0:20}" "${up_mbps}" "${dl_mbps} Mbit/s" "${lat_ms}" | tee -a "$LOG_FILE"
+    return 0
+}
+
+# 按大区测试中国节点：先测 speedtest.cn 三网节点，若被境外防火墙拦截则自动启用该城市 443 骨干节点保底
 test_cn_region_http() {
     local region_label=$1
     local primary_regex=$2
     local fallback_regex=$3
     local max_success=${4:-2}
+    local bb_url_1=$5
+    local bb_label_1=$6
+    local bb_url_2=$7
+    local bb_label_2=$8
+
     local db_file="$WORK_DIR/cn_nodes_all.csv"
-    [[ ! -s "$db_file" ]] && return 1
-
-    # 从 CT/CU/CM 中均匀抽取候选节点（首选城市在前，同大区替补在后）
-    local raw_candidates=""
-    local isp
-    for isp in CT CU CM; do
-        raw_candidates+=$(grep "^${isp}|" "$db_file" | grep -E "$primary_regex" | head -n 5)$'\n'
-    done
-    for isp in CT CU CM; do
-        raw_candidates+=$(grep "^${isp}|" "$db_file" | grep -E "$fallback_regex" | head -n 4)$'\n'
-    done
-
-    raw_candidates=$(echo "$raw_candidates" | awk 'NF > 0 && !seen[$0]++')
-    [[ -z "$raw_candidates" ]] && return 1
-
-    # 6 线程并发对候选节点进行 2 秒快速 HTTP 探活，瞬间滤除死节点或锁区节点
-    local alive_nodes
-    alive_nodes=$(echo "$raw_candidates" | head -n 24 | xargs -P 6 -I {} "$WORK_DIR/probe_cn.sh" "{}" 2>/dev/null)
-    [[ -z "$alive_nodes" ]] && return 1
-
     local success_count=0
     local tested_isps=" "
-    local tested_urls=" "
-    local line c_isp c_prov c_city c_tconn c_dl c_ul label
 
-    # 第一轮：优先测试不同运营商 (CT / CU / CM)
-    while IFS='|' read -r c_isp c_prov c_city c_tconn c_dl c_ul; do
-        [[ -z "$c_dl" ]] && continue
-        [[ $success_count -ge $max_success ]] && break
-        [[ "$tested_isps" == *" $c_isp "* ]] && continue
+    if [[ -s "$db_file" ]]; then
+        local raw_candidates=""
+        local isp
+        for isp in CT CU CM; do
+            raw_candidates+=$(grep "^${isp}|" "$db_file" | grep -E "$primary_regex" | head -n 8)$'\n'
+        done
+        for isp in CT CU CM; do
+            raw_candidates+=$(grep "^${isp}|" "$db_file" | grep -E "$fallback_regex" | head -n 6)$'\n'
+        done
 
-        label=$(printf "%-13s %s" "$region_label" "$c_isp")
-        tested_urls+="$c_dl "
-        if run_cn_http_test "$label" "$c_tconn" "$c_dl" "$c_ul"; then
-            tested_isps+="$c_isp "
-            ((++success_count))
+        raw_candidates=$(echo "$raw_candidates" | awk 'NF > 0 && !seen[$0]++')
+
+        if [[ -n "$raw_candidates" ]]; then
+            # 10 线程并发探活最多 36 个不重复主机
+            local alive_nodes
+            alive_nodes=$(echo "$raw_candidates" | head -n 36 | xargs -P 10 -I {} "$WORK_DIR/probe_cn.sh" "{}" 2>/dev/null)
+
+            if [[ -n "$alive_nodes" ]]; then
+                local c_isp c_prov c_city c_lat c_dl c_ul label
+                # 严格要求每个运营商 (CT / CU / CM) 最多只打印一次，绝不重复打印两行相同名称
+                while IFS='|' read -r c_isp c_prov c_city c_lat c_dl c_ul; do
+                    [[ -z "$c_dl" ]] && continue
+                    [[ $success_count -ge $max_success ]] && break
+                    [[ "$tested_isps" == *" $c_isp "* ]] && continue
+
+                    label=$(printf "%-13s %s" "$region_label" "$c_isp")
+                    if run_cn_http_test "$label" "$c_lat" "$c_dl" "$c_ul"; then
+                        tested_isps+="$c_isp "
+                        ((++success_count))
+                    fi
+                done <<< "$alive_nodes"
+            fi
         fi
-    done <<< "$alive_nodes"
+    fi
 
-    # 第二轮：若未达到期望节点数，从剩余存活节点中补齐
-    while IFS='|' read -r c_isp c_prov c_city c_tconn c_dl c_ul; do
-        [[ -z "$c_dl" ]] && continue
-        [[ $success_count -ge $max_success ]] && break
-        [[ "$tested_urls" == *" $c_dl "* ]] && continue
-
-        label=$(printf "%-13s %s" "$region_label" "$c_isp")
-        tested_urls+="$c_dl "
-        if run_cn_http_test "$label" "$c_tconn" "$c_dl" "$c_ul"; then
-            ((++success_count))
+    # 若该地区 :8080 节点对海外 IP 全部封锁（success_count == 0），启用部署在该城市本地的 443 骨干节点保底
+    if [[ $success_count -eq 0 && -n "$bb_url_1" ]]; then
+        run_cn_backbone_fallback "$bb_label_1" "$bb_url_1" "" && ((++success_count))
+        if [[ $success_count -lt $max_success && -n "$bb_url_2" ]]; then
+            run_cn_backbone_fallback "$bb_label_2" "$bb_url_2" "" && ((++success_count))
         fi
-    done <<< "$alive_nodes"
+    fi
 
     [[ $success_count -gt 0 ]] && return 0 || return 1
 }
@@ -792,27 +877,39 @@ run_china_speedtest() {
     local nodes_per_region=${1:-2}
     local total_cn_success=0
 
-    if init_cn_node_db; then
-        # 1. 西安 / 西北节点 (首选陕西/西安，同区替补甘肃/宁夏/河南/四川)
-        test_cn_region_http "CN Xi'an"     "西安|咸阳|陕西"           "兰州|甘肃|银川|宁夏|郑州|河南|成都|重庆" "$nodes_per_region" && ((++total_cn_success))
+    init_cn_node_db || true
 
-        # 2. 北京 / 华北节点 (首选北京，同区替补天津/河北/山东/辽宁)
-        test_cn_region_http "CN Beijing"   "北京"                     "天津|石家庄|河北|保定|济南|青岛|山东|沈阳" "$nodes_per_region" && ((++total_cn_success))
+    # 1. 西安节点 (首选陕西/西安 :8080 三网，保底：西安交大/西北农林 443 千兆节点)
+    test_cn_region_http "CN Xi'an" \
+        "西安|咸阳|陕西" \
+        "兰州|甘肃|银川|宁夏|郑州|河南|成都|重庆|太原|山西" \
+        "$nodes_per_region" \
+        "https://mirrors.xjtu.edu.cn/ubuntu/ls-lR.gz" "CN Xi'an      BN" \
+        "https://mirrors.nwafu.edu.cn/ubuntu/ls-lR.gz" "CN Shaanxi    BN" && ((++total_cn_success))
 
-        # 3. 上海 / 华东节点 (首选上海，同区替补江苏苏州/南京/镇江/浙江杭州/宁波)
-        test_cn_region_http "CN Shanghai"  "上海"                     "苏州|南京|镇江|无锡|昆山|江苏|杭州|宁波|浙江|合肥" "$nodes_per_region" && ((++total_cn_success))
+    # 2. 北京节点 (首选北京 :8080 三网，保底：北京北外/清华 443 千兆节点)
+    test_cn_region_http "CN Beijing" \
+        "北京" \
+        "天津|石家庄|河北|保定|济南|青岛|山东|沈阳|辽宁" \
+        "$nodes_per_region" \
+        "https://mirrors.bfsu.edu.cn/ubuntu/ls-lR.gz" "CN Beijing    BN" \
+        "https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ls-lR.gz" "CN Beijing2   BN" && ((++total_cn_success))
 
-        # 4. 广东 / 华南节点 (首选广州/深圳/广东，同区替补福建/湖南/广西)
-        test_cn_region_http "CN Guangdong" "广州|深圳|东莞|佛山|广东" "福州|厦门|泉州|福建|长沙|湖南|南宁|广西" "$nodes_per_region" && ((++total_cn_success))
-    fi
+    # 3. 上海节点 (首选上海 :8080 三网，保底：上海交大/南京大学 443 千兆节点)
+    test_cn_region_http "CN Shanghai" \
+        "上海" \
+        "苏州|南京|镇江|无锡|昆山|江苏|杭州|宁波|浙江|合肥" \
+        "$nodes_per_region" \
+        "https://mirror.sjtu.edu.cn/ubuntu/ls-lR.gz" "CN Shanghai   BN" \
+        "https://mirrors.nju.edu.cn/ubuntu/ls-lR.gz" "CN EastChina  BN" && ((++total_cn_success))
 
-    # 若遇到极端情况 CSV 下载失败，回退尝试 Ookla 仅存的国内大区节点
-    if [[ $total_cn_success -eq 0 && -x "$WORK_DIR/speedtest" ]]; then
-        speed_test_ookla "43752" "CN Beijing    CU" && ((++total_cn_success))
-        speed_test_ookla "24447" "CN Shanghai   CU" && ((++total_cn_success))
-        speed_test_ookla "5396"  "CN Suzhou     CT" && ((++total_cn_success))
-        speed_test_ookla "59387" "CN Ningbo     CT" && ((++total_cn_success))
-    fi
+    # 4. 广东节点 (首选广州/深圳/广东 :8080 三网，保底：深圳南科大/广州腾讯 443 千兆节点)
+    test_cn_region_http "CN Guangdong" \
+        "广州|深圳|东莞|佛山|中山|珠海|惠州|广东" \
+        "福州|厦门|泉州|福建|长沙|湖南|南宁|广西" \
+        "$nodes_per_region" \
+        "https://mirrors.sustech.edu.cn/ubuntu/ls-lR.gz" "CN Guangdong  BN" \
+        "https://mirrors.cloud.tencent.com/ubuntu/ls-lR.gz" "CN Guangzhou  BN" && ((++total_cn_success))
 
     [[ $total_cn_success -gt 0 ]] && return 0 || return 1
 }
@@ -827,7 +924,7 @@ print_speedtest() {
     speed_fast_com || true
     speed_cloudflare_cdn || true
 
-    # 2. 中国四大核心区域测速 (西安 / 北京 / 上海 / 广东，标准模式每区测 2 个不同运营商节点)
+    # 2. 中国四大核心区域测速 (西安 / 北京 / 上海 / 广东，标准模式每区测最多 2 个不同运营商节点)
     run_china_speedtest 2 || true
 }
 
