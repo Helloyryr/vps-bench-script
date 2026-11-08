@@ -271,7 +271,7 @@ virt_check() {
 # 使用 POSIX 标准 1K 块精确汇总磁盘容量（消除原版单位换算 Bug）
 calc_disk_info() {
     local df_out
-    df_out=$(LC_ALL=C df -kP 2>/dev/null | grep -wvE '^Filesystem|none|tmpfs|devtmpfs|overlay|shm|udev|squashfs|efivarfs|iso9660')
+    df_out=$(LC_ALL=C df -kP 2>/dev/null | grep -wvE '^Filesystem|none|tmpfs|devtmpfs|overlay|shm|udev|squashfs|efivarfs|iso9660' | awk '!seen[$1]++')
     disk_total_size=$(echo "$df_out" | awk '{sum += $2} END {printf "%.1f", sum / 1048576}')
     disk_used_size=$(echo "$df_out" | awk '{sum += $3} END {printf "%.1f", sum / 1048576}')
 }
@@ -372,7 +372,7 @@ print_system_info() {
 json_extract() {
     local json=$1
     local key=$2
-    echo "$json" | tr ',' '\n' | awk -F'"' -v k="$key" '$2 == k {print $4; exit}'
+    echo "$json" | grep -oE "\"${key}\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | head -n1 | sed -E "s/\"${key}\"[[:space:]]*:[[:space:]]*\"([^\"]*)\"/\1/"
 }
 
 ip_info() {
@@ -527,35 +527,54 @@ install_speedtest() {
     fi
     return 1
 }
-
-# 纯 Curl 测速兜底（替代原版失效的 Python fast_com.py）
+# 纯 Curl 测速（支持真实延迟、上传、下载测速，告别 N/A 和 -）
 speed_cloudflare_fallback() {
     command -v curl >/dev/null 2>&1 || return
-    local dl_bps
-    dl_bps=$(curl -4 -sSL -w "%{speed_download}" --connect-timeout 5 --max-time 12 -o /dev/null "https://speed.cloudflare.com/__down?bytes=50000000" 2>/dev/null)
+
+    # 1. 测量连接延迟 (ms)
+    local lat_sec lat_ms
+    lat_sec=$(curl -4 -o /dev/null -s -w "%{time_connect}" --connect-timeout 5 "https://speed.cloudflare.com/__down?bytes=0" 2>/dev/null)
+    if [[ -n "$lat_sec" ]]; then
+        lat_ms=$(awk -v s="$lat_sec" 'BEGIN {if (s>0) printf "%.2f ms", s * 1000; else print "N/A"}')
+    else
+        lat_ms="N/A"
+    fi
+
+    # 2. 测量下载速度 (取 25MB 防止超时截断)
+    local dl_bps dl_mbps="0.00"
+    dl_bps=$(curl -4 -sSL -w "%{speed_download}" --connect-timeout 5 --max-time 10 -o /dev/null "https://speed.cloudflare.com/__down?bytes=25000000" 2>/dev/null)
     if [[ -n "$dl_bps" ]]; then
-        local dl_mbps
         dl_mbps=$(awk -v bps="$dl_bps" 'BEGIN {printf "%.2f", (bps * 8) / 1000000}')
-        if [[ $(awk -v m="$dl_mbps" 'BEGIN {print (m > 0) ? 1 : 0}') -eq 1 ]]; then
-            printf "${YELLOW}%-18s${GREEN}%-18s${RED}%-20s${SKYBLUE}%-12s${PLAIN}\n" " Cloudflare CDN" "N/A" "${dl_mbps} Mbit/s" "-" | tee -a "$LOG_FILE"
-        fi
+    fi
+
+    # 3. 测量上传速度 (上传 10MB 数据流)
+    local up_bps up_mbps="0.00"
+    up_bps=$(dd if=/dev/zero bs=1M count=10 2>/dev/null | curl -4 -sSL -w "%{speed_upload}" --connect-timeout 5 --max-time 10 -o /dev/null --data-binary @- "https://speed.cloudflare.com/__up" 2>/dev/null)
+    if [[ -n "$up_bps" ]]; then
+        up_mbps=$(awk -v bps="$up_bps" 'BEGIN {printf "%.2f", (bps * 8) / 1000000}')
+    fi
+
+    if [[ $(awk -v m="$dl_mbps" 'BEGIN {print (m > 0) ? 1 : 0}') -eq 1 ]]; then
+        printf "${YELLOW}%-22s${GREEN}%-16s${RED}%-18s${SKYBLUE}%-12s${PLAIN}\n" " Cloudflare CDN" "${up_mbps} Mbit/s" "${dl_mbps} Mbit/s" "${lat_ms}" | tee -a "$LOG_FILE"
     fi
 }
-
 
 speed_test() {
     local node_id=$1
     local node_name=$2
     local st_bin="$WORK_DIR/speedtest"
-    [[ ! -x "$st_bin" ]] && return
+    [[ ! -x "$st_bin" ]] && return 1
+
+    # 增加 timeout 45 秒保护，防止失效节点无限卡死
+    local cmd_prefix=()
+    command -v timeout >/dev/null 2>&1 && cmd_prefix=(timeout 45)
 
     if [[ -z "$node_id" ]]; then
-        HOME="$WORK_DIR" "$st_bin" -p no --accept-license --accept-gdpr > "$SPEED_LOG" 2>&1
+        HOME="$WORK_DIR" "${cmd_prefix[@]}" "$st_bin" -p no --accept-license --accept-gdpr > "$SPEED_LOG" 2>&1
     else
-        HOME="$WORK_DIR" "$st_bin" -p no -s "$node_id" --accept-license --accept-gdpr > "$SPEED_LOG" 2>&1
+        HOME="$WORK_DIR" "${cmd_prefix[@]}" "$st_bin" -p no -s "$node_id" --accept-license --accept-gdpr > "$SPEED_LOG" 2>&1
     fi
 
-    # 使用正则直接提取冒号后的浮点数，彻底规避 \r 回车符与字段列数偏移
     local dl up lat current_url
     dl=$(grep -oE 'Download:[[:space:]]*[0-9.]+' "$SPEED_LOG" 2>/dev/null | tail -n1 | awk -F: '{gsub(/ /, "", $2); print $2}')
     up=$(grep -oE 'Upload:[[:space:]]*[0-9.]+' "$SPEED_LOG" 2>/dev/null | tail -n1 | awk -F: '{gsub(/ /, "", $2); print $2}')
@@ -569,55 +588,58 @@ speed_test() {
     fi
 
     if [[ -n "$dl" ]]; then
-        printf "${YELLOW}%-18s${GREEN}%-18s${RED}%-20s${SKYBLUE}%-12s${PLAIN}\n" " ${node_name:0:16}" "${up:-0.00} Mbit/s" "${dl} Mbit/s" "${lat:-N/A} ms" | tee -a "$LOG_FILE"
+        # 放宽 Node Name 列宽到 22 字符，不再腰斩节点名
+        printf "${YELLOW}%-22s${GREEN}%-16s${RED}%-18s${SKYBLUE}%-12s${PLAIN}\n" " ${node_name:0:20}" "${up:-0.00} Mbit/s" "${dl} Mbit/s" "${lat:-N/A} ms" | tee -a "$LOG_FILE"
+        return 0
     fi
+    return 1
 }
 
-
 run_dynamic_speedtest() {
-    # 动态节点数量建议设为 2~3 个即可
-    local max_nearby=${1:-2}
+    local max_nearby=${1:-4}
     local st_bin="$WORK_DIR/speedtest"
-    [[ ! -x "$st_bin" ]] && return
+    [[ ! -x "$st_bin" ]] && return 1
 
-    # 1. 国内三网固定节点（国内 VPS 必测，国外机器可看回国速度）
-    speed_test '24447' 'Shanghai 5G  CU'
-    speed_test '5396'  'Suzhou 5G    CT'
-    speed_test '25858' 'Beijing      CM'
+    local success_count=0
 
-    # 2. 国际/亚太常用节点（可按需只留 1-2 个热门）
-    speed_test '32291' 'HongKong     CN'
+    # 1. 默认自动测速最优节点 (Auto Best)
+    speed_test '' 'Speedtest Default' && ((success_count++))
 
-    # 3. 动态拉取机器本地附近的节点（跳过第1个，避免与Auto重复，只取2个）
+    # 2. 动态拉取机器附近的节点（跳过第 1 个避免与 Default 重复，去掉多余的 Nearby: 前缀防截断）
     local server_list
     server_list=$(HOME="$WORK_DIR" "$st_bin" -L --accept-license --accept-gdpr 2>/dev/null | awk '/^[[:space:]]*[0-9]+[[:space:]]+/ {
         id=$1;
         $1="";
         gsub(/^[[:space:]]+/, "", $0);
-        printf "%s|%s\n", id, substr($0, 1, 15)
-    }' | head -n "$max_nearby")
+        printf "%s|%s\n", id, substr($0, 1, 20)
+    }' | tail -n +2 | head -n "$max_nearby")
 
-    local line sid sname
+    local sid sname
     while IFS='|' read -r sid sname; do
         [[ -z "$sid" ]] && continue
-        speed_test "$sid" "Nearby: $sname"
+        speed_test "$sid" "$sname" && ((success_count++))
     done <<< "$server_list"
+
+    [[ $success_count -gt 0 ]] && return 0 || return 1
 }
 
 print_speedtest() {
-    printf "%-18s%-18s%-20s%-12s\n" " Node Name" "Upload Speed" "Download Speed" "Latency" | tee -a "$LOG_FILE"
+    printf "%-22s%-16s%-18s%-12s\n" " Node Name" "Upload Speed" "Download Speed" "Latency" | tee -a "$LOG_FILE"
     if install_speedtest; then
-        run_dynamic_speedtest 4
+        # 如果你想每次都测 Cloudflare，把下面的 || 改成 ; 即可
+        run_dynamic_speedtest 3 || speed_cloudflare_fallback
+    else
+        speed_cloudflare_fallback
     fi
-    speed_cloudflare_fallback
 }
 
 print_speedtest_fast() {
-    printf "%-18s%-18s%-20s%-12s\n" " Node Name" "Upload Speed" "Download Speed" "Latency" | tee -a "$LOG_FILE"
+    printf "%-22s%-16s%-18s%-12s\n" " Node Name" "Upload Speed" "Download Speed" "Latency" | tee -a "$LOG_FILE"
     if install_speedtest; then
-        run_dynamic_speedtest 2
+        run_dynamic_speedtest 1 || speed_cloudflare_fallback
+    else
+        speed_cloudflare_fallback
     fi
-    speed_cloudflare_fallback
 }
 
 
