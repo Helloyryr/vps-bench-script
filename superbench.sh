@@ -46,13 +46,17 @@ check_privilege() {
 
 # 寻找既【可写】又【允许执行二进制 (非 noexec)】的临时工作目录
 find_exec_dir() {
-    local candidates=("/var/tmp" "${HOME:-/tmp}/.cache" "/tmp" "$PWD")
+    # 优先使用 /tmp（系统重启可自动回收），若受 noexec 限制再自动回退到 /var/tmp
+    local candidates=("/tmp" "/var/tmp" "${HOME:-/tmp}/.cache" "$PWD")
     local dir test_dir test_bin
 
     for dir in "${candidates[@]}"; do
         [[ -z "$dir" ]] && continue
         mkdir -p "$dir" 2>/dev/null || continue
         [[ ! -w "$dir" ]] && continue
+
+        # 顺手清理可能因历史断电/强杀遗留超过 1 天的旧临时目录
+        find "$dir" -maxdepth 1 -type d -name "superbench.*" -mtime +1 -exec rm -rf {} + 2>/dev/null || true
 
         test_dir=$(mktemp -d "$dir/superbench.XXXXXX" 2>/dev/null) || continue
         chmod 700 "$test_dir" 2>/dev/null
@@ -81,7 +85,6 @@ find_io_dir() {
 
     for dir in "${candidates[@]}"; do
         [[ -z "$dir" || ! -d "$dir" || ! -w "$dir" ]] && continue
-        # 获取目录所在挂载点的文件系统类型
         fstype=$(df -PT "$dir" 2>/dev/null | awk 'NR==2 {print $2}')
         case "$fstype" in
             tmpfs|ramfs|devtmpfs|squashfs|iso9660|overlay)
@@ -94,33 +97,35 @@ find_io_dir() {
         esac
     done
 
-    # 若所有可写目录均为 overlay/tmpfs（如部分精简容器环境），兜底使用 WORK_DIR
     IO_DIR="$WORK_DIR"
 }
 
-# 安全初始化日志文件（兼容当前目录只读的情况）
+# 安全初始化日志文件（直接放入 WORK_DIR，跑完自动通过 paste.rs 分享并随目录销毁，不污染当前目录）
 init_log_file() {
-    local candidates=("$PWD" "${HOME:-}" "$WORK_DIR")
-    local dir
-    for dir in "${candidates[@]}"; do
-        if [[ -n "$dir" && -d "$dir" && -w "$dir" ]]; then
-            LOG_FILE="$dir/superbench.log"
-            if : > "$LOG_FILE" 2>/dev/null; then
-                chmod 600 "$LOG_FILE" 2>/dev/null
-                break
-            fi
-        fi
-    done
+    LOG_FILE="$WORK_DIR/superbench.log"
     SPEED_LOG="$WORK_DIR/speedtest.log"
+    : > "$LOG_FILE"
     : > "$SPEED_LOG"
+    chmod 600 "$LOG_FILE" "$SPEED_LOG" 2>/dev/null
 }
 
-# 安全退出清理函数（仅清理隔离目录与带 PID 的测试文件，绝不误删用户文件）
+# 安全退出清理函数（先杀子进程释放文件锁，再彻底删除隔离目录）
 cleanup() {
-    [[ -n "$IO_DIR" && -d "$IO_DIR" ]] && rm -f "$IO_DIR"/sb_io_test_$$_* 2>/dev/null
-    [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]] && rm -rf "$WORK_DIR" 2>/dev/null
-}
+    # 卸载 trap 防止重复触发
+    trap - EXIT INT TERM HUP QUIT
 
+    # 终止可能还在后台写文件的子进程（如 speedtest / dd）
+    pkill -P $$ >/dev/null 2>&1 || true
+
+    [[ -n "$IO_DIR" && -d "$IO_DIR" ]] && rm -f "$IO_DIR"/sb_io_test_$$_* 2>/dev/null
+
+    if [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]]; then
+        rm -rf "$WORK_DIR" 2>/dev/null || {
+            sleep 0.2
+            rm -rf "$WORK_DIR" 2>/dev/null
+        }
+    fi
+}
 cancel() {
     echo ""
     next
@@ -131,7 +136,7 @@ cancel() {
 }
 
 trap cleanup EXIT
-trap cancel INT TERM
+trap cancel INT TERM HUP QUIT
 
 # ======================== 跨平台依赖管理 ========================
 
@@ -545,9 +550,9 @@ speed_test() {
     [[ ! -x "$st_bin" ]] && return
 
     if [[ -z "$node_id" ]]; then
-        "$st_bin" -p no --accept-license --accept-gdpr > "$SPEED_LOG" 2>&1
+        HOME="$WORK_DIR" "$st_bin" -p no --accept-license --accept-gdpr > "$SPEED_LOG" 2>&1
     else
-        "$st_bin" -p no -s "$node_id" --accept-license --accept-gdpr > "$SPEED_LOG" 2>&1
+        HOME="$WORK_DIR" "$st_bin" -p no -s "$node_id" --accept-license --accept-gdpr > "$SPEED_LOG" 2>&1
     fi
 
     # 使用正则直接提取冒号后的浮点数，彻底规避 \r 回车符与字段列数偏移
@@ -585,7 +590,7 @@ run_dynamic_speedtest() {
 
     # 3. 动态拉取机器本地附近的节点（跳过第1个，避免与Auto重复，只取2个）
     local server_list
-    server_list=$("$st_bin" -L --accept-license --accept-gdpr 2>/dev/null | awk '/^[[:space:]]*[0-9]+[[:space:]]+/ {
+    server_list=$(HOME="$WORK_DIR" "$st_bin" -L --accept-license --accept-gdpr 2>/dev/null | awk '/^[[:space:]]*[0-9]+[[:space:]]+/ {
         id=$1;
         $1="";
         gsub(/^[[:space:]]+/, "", $0);
