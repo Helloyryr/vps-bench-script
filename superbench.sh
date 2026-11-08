@@ -206,7 +206,11 @@ about() {
 }
 
 next() {
-    printf "%-70s\n" "-" | sed 's/\s/-/g' | tee -a "$LOG_FILE"
+    if [[ -n "$LOG_FILE" ]]; then
+        printf "%-70s\n" "-" | sed 's/\s/-/g' | tee -a "$LOG_FILE"
+    else
+        printf "%-70s\n" "-" | sed 's/\s/-/g'
+    fi
 }
 
 get_opsy() {
@@ -717,7 +721,6 @@ print_end_time() {
 
     bj_time=$(TZ='Asia/Shanghai' date "+%Y-%m-%d %H:%M:%S" 2>/dev/null || date -u "+%Y-%m-%d %H:%M:%S UTC")
     echo " Timestamp    : $bj_time (GMT+8)" | tee -a "$LOG_FILE"
-    echo " Results Log  : $LOG_FILE"
 }
 
 sharetest() {
