@@ -27,35 +27,35 @@
 使用 `curl` 一键运行：
 
 ```bash
-curl -fsSL [https://raw.githubusercontent.com/](https://raw.githubusercontent.com/)Helloyryr/vps-bench-script/main/superbench.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Helloyryr/vps-bench-script/main/superbench.sh | bash
 ```
 
 或者使用 `wget` 一键运行：
 
 ```bash
-wget -qO- [https://raw.githubusercontent.com/](https://raw.githubusercontent.com/)Helloyryr/vps-bench-script/main/superbench.sh | bash
+wget -qO- https://raw.githubusercontent.com/Helloyryr/vps-bench-script/main/superbench.sh | bash
 ```
 
 ### 2. 指定测试模式（管道传参）
 
 ```bash
 # 快速测试模式（小文件 I/O + 精简测速节点）
-curl -fsSL [https://raw.githubusercontent.com/](https://raw.githubusercontent.com/)Helloyryr/vps-bench-script/main/superbench.sh | bash -s -- fast
+curl -fsSL https://raw.githubusercontent.com/Helloyryr/vps-bench-script/main/superbench.sh | bash -s -- fast
 
 # 仅查看系统与硬件信息（秒级输出）
-curl -fsSL [https://raw.githubusercontent.com/](https://raw.githubusercontent.com/)Helloyryr/vps-bench-script/main/superbench.sh | bash -s -- info
+curl -fsSL https://raw.githubusercontent.com/Helloyryr/vps-bench-script/main/superbench.sh | bash -s -- info
 
 # 仅测试磁盘 I/O 性能
-curl -fsSL [https://raw.githubusercontent.com/](https://raw.githubusercontent.com/)Helloyryr/vps-bench-script/main/superbench.sh | bash -s -- io
+curl -fsSL https://raw.githubusercontent.com/Helloyryr/vps-bench-script/main/superbench.sh | bash -s -- io
 
 # 仅执行国内外网络测速
-curl -fsSL [https://raw.githubusercontent.com/](https://raw.githubusercontent.com/)Helloyryr/vps-bench-script/main/superbench.sh | bash -s -- speed
+curl -fsSL https://raw.githubusercontent.com/Helloyryr/vps-bench-script/main/superbench.sh | bash -s -- speed
 ```
 
 ### 3. 下载到本地运行
 
 ```bash
-curl -fsSLO [https://raw.githubusercontent.com/](https://raw.githubusercontent.com/)Helloyryr/vps-bench-script/main/superbench.sh
+curl -fsSLO https://raw.githubusercontent.com/Helloyryr/vps-bench-script/main/superbench.sh
 chmod +x superbench.sh
 ./superbench.sh
 ```
